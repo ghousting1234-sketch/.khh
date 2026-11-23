@@ -1,1255 +1,1228 @@
---[[
-	VolleyBomb :: Loading.lua  (reescrita v2.0.0)
-	Cole na ordem: 1..9
-	Fluxo: guarda -> http/cache -> stealth -> snapshot/limiter/watchdog
-	       -> painel -> varredura de key -> bootstrap do payload
-]]
+--=============================================================
+-- VolleyBomb Loader v2
+-- camadas: key bypass | stealth | otimizacoes | anti-kick
+--          anti-ban | anti-fling | painel proprio
+--=============================================================
 
-local VERSION = "2.0.0"
+local START = os.clock()
+local RUN   = game:GetService("RunService")
+local UIS   = game:GetService("UserInputService")
+local PLR   = game:GetService("Players")
+local TS    = game:GetService("TweenService")
+local LIGHT = game:GetService("Lighting")
+local STATS = game:GetService("Stats")
 
-local RAW     = "https://raw.githubusercontent.com/Biskus0/VolleyBomb/refs/heads/main/"
-local SELF    = RAW .. "Loading.lua"
-local UI_BASE = "https://raw.githubusercontent.com/Biskus0/UIConstructor/refs/heads/main/"
+local LP = PLR.LocalPlayer
+if not LP then pcall(function() LP = PLR:WaitForChild("LocalPlayer", 20) end) end
 
 local CONFIG = {
-	httpTimeout       = 12,
-	retries           = 4,
-	fpsCap            = 240,
-	cacheDir          = "VolleyBombCache",
-	keyMonitorSeconds = 20,
-	rateLimit         = 45,
-	maxVelocity       = 900,
-	snapStuds         = 45,
-	useRemoteLoader   = false,
+	discord = "https://discord.gg/askvenice", -- troque pelo convite do projeto
+	fpsCap = 240,
+	rateLimit = 45,
+	clampVelocity = 900,
+	keyWindow = 20,
+	httpTimeout = 10,
+	retries = 3,
+	cacheMin = 64,
+	gh = "https://raw.githubusercontent.com/Biskus0/",
 }
 
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local UIS          = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local Lighting     = game:GetService("Lighting")
-local Stats        = game:GetService("Stats")
-local Teleport     = game:GetService("TeleportService")
-local HttpService  = game:GetService("HttpService")
-local StarterGui   = game:GetService("StarterGui")
+local VOL = CONFIG.gh .. "VolleyBomb/refs/heads/main/"
+local UIC = CONFIG.gh .. "UIConstructor/refs/heads/main/"
 
-local LP = Players.LocalPlayer
-
-local ALPHA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-local function randStr(n)
+local function rand(n)
+	local pool = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	local out = {}
 	for i = 1, n do
-		local k = math.random(1, #ALPHA)
-		out[i] = ALPHA:sub(k, k)
+		local k = math.random(1, #pool)
+		out[i] = pool:sub(k, k)
 	end
 	return table.concat(out)
 end
 
-local STATE_KEY = "_" .. randStr(12)
-local GUI_NAME  = randStr(math.random(9, 14))
+local SKEY = "__vb_" .. rand(6)
+local GENV = getgenv()
 
-local G     = getgenv and getgenv() or _G
-local Api   = {}
-local alive = true
-
-local function teardown()
-	if not alive then return end
-	alive = false
-	for i = #Api, 1, -1 do
-		pcall(Api[i])
-	end
-	Api = {}
-	if G[STATE_KEY] ~= nil then G[STATE_KEY] = nil end
+-- guarda de instancia contra execucao dupla
+if GENV[SKEY] and GENV[SKEY].alive then
+	pcall(function() GENV[SKEY].destroy() end)
 end
 
-local previous = G[STATE_KEY]
-if type(previous) == "table" and previous.teardown then
-	pcall(previous.teardown)
-end
-
-G[STATE_KEY] = { version = VERSION, teardown = teardown, startedAt = os.time() }
-
--- log ------------------------------------------------------------
-local Log = { buffer = {}, bound = nil, limit = 250 }
-local baseClock = os.clock()
+local S = {
+	alive = true,
+	guiName = rand(math.random(9, 14)),
+	logs = {},
+	restored = false,
+	reversals = 0,
+	kills = 0,
+	kickMode = "soft",
+	frames = 0,
+	fps = 0,
+	win = os.clock(),
+	snapshot = nil,
+	cacheHits = 0,
+	cacheWrites = 0,
+	hudOn = true,
+	flingOn = true,
+}
+GENV[SKEY] = S
 
 local function stamp()
-	local ok, v = pcall(os.date, "%H:%M:%S")
-	if ok then return v end
-	return string.format("%06.2f", os.clock() - baseClock)
+	local ok, d = pcall(os.date, "*t")
+	if ok and d then
+		return string.format("%02d:%02d:%02d", d.hour, d.min, d.sec)
+	end
+	return tostring(math.floor(os.clock()))
 end
 
-local function log(level, msg)
-	local entry = { t = stamp(), lvl = level, msg = tostring(msg) }
-	Log.buffer[#Log.buffer + 1] = entry
-	if #Log.buffer > Log.limit then table.remove(Log.buffer, 1) end
-	if Log.bound then pcall(Log.bound, entry) end
+local function log(tag, msg)
+	local line = stamp() .. "  " .. tag .. "  " .. tostring(msg)
+	table.insert(S.logs, line)
+	if #S.logs > 200 then table.remove(S.logs, 1) end
+	if S.console and S.console.Parent then
+		local l = Instance.new("TextLabel")
+		l.BackgroundTransparency = 1
+		l.Font = Enum.Font.Code
+		l.TextSize = 11
+		l.TextXAlignment = Enum.TextXAlignment.Left
+		l.TextColor3 = Color3.fromRGB(160, 170, 190)
+		l.Size = UDim2.new(1, -8, 0, 14)
+		l.Text = line
+		l.Parent = S.console
+		task.defer(function()
+			if S.console then
+				S.console.CanvasPosition = Vector2.new(0, S.console.AbsoluteCanvasSize.Y)
+			end
+		end)
+	end
 end
 
-local function notify(title, text, dur)
+local function notify(txt)
 	pcall(function()
-		StarterGui:SetCore("SendNotification", {
-			Title = tostring(title), Text = tostring(text), Duration = dur or 4,
+		game:GetService("StarterGui"):SetCore("SendNotification", {
+			Title = "VolleyBomb",
+			Text = tostring(txt),
+			Duration = 3,
 		})
 	end)
-	log("info", title .. " :: " .. text)
 end
 
-log("info", "carregando " .. VERSION .. " (" .. GUI_NAME .. ")")-- http -----------------------------------------------------------
-local Http = {}
-
-local function fsReady()
-	return type(writefile) == "function"
-		and type(readfile) == "function"
-		and type(isfile) == "function"
-end
-
-local function ensureDir()
-	if not fsReady() then return false end
-	if type(makefolder) == "function" and type(isfolder) == "function" then
-		if not isfolder(CONFIG.cacheDir) then pcall(makefolder, CONFIG.cacheDir) end
+local function hash(str)
+	local h = 2166136261
+	for i = 1, #str do
+		h = bit32.bxor(h, str:byte(i))
+		h = bit32.bmul(h, 16777619)
 	end
-	return true
-end
-ensureDir()
-
-local function cachePath(url)
-	local h = 5381
-	for i = 1, #url do
-		h = (h * 33 + url:byte(i)) % 4294967296
-	end
-	return CONFIG.cacheDir .. "/" .. string.format("%08x", h) .. ".lua"
+	return string.format("%x", h)
 end
 
-local function looksBad(body)
-	if type(body) ~= "string" then return true end
-	if #body < 64 then return true end
-	local head = body:sub(1, 240):lower()
-	if head:find("<!doctype", 1, true) then return true end
-	if head:find("<html", 1, true) then return true end
-	if head:find("404: not found", 1, true) then return true end
-	if head:find("rate limit", 1, true) then return true end
-	if head:find("too many requests", 1, true) then return true end
-	return false
-end
+local httpReq = (syn and syn.request) or (http and http.request) or http_request or request
 
-local function rawFetch(url)
-	local done, ok, body = false, false, nil
-	task.spawn(function()
-		local fn = game.HttpGetAsync or game.HttpGet
-		local s, r = pcall(fn, game, url)
-		ok, body = s, r
-		done = true
-	end)
-	local t0 = os.clock()
-	while not done and (os.clock() - t0) < CONFIG.httpTimeout do
-		task.wait(0.02)
-	end
-	if not done then return false, "timeout" end
-	if not ok then return false, tostring(body) end
-	return true, body
-end
+local function fetch(url)
+	local cacheFile = "vb_" .. hash(url) .. ".lua"
 
-function Http.get(url, label, opts)
-	opts = opts or {}
-	local path = cachePath(url)
-	local cached
-	if fsReady() and isfile(path) then
-		local s, data = pcall(readfile, path)
-		if s and not looksBad(data) then cached = data end
+	if isfile and readfile then
+		local okS, size = pcall(getfilesize, cacheFile)
+		if okS and size and size >= CONFIG.cacheMin then
+			local okR, data = pcall(readfile, cacheFile)
+			if okR and type(data) == "string" and #data >= CONFIG.cacheMin then
+				S.cacheHits = S.cacheHits + 1
+				log("cache", url:sub(-26))
+				return data
+			end
+		end
 	end
 
-	if cached and not opts.bypass then
-		log("cache", label .. " do disco (" .. #cached .. "b)")
-		return cached
-	end
-
+	local last
 	for attempt = 1, CONFIG.retries do
-		local ok, body = rawFetch(url)
-		if ok and not looksBad(body) then
-			if fsReady() then pcall(writefile, path, body) end
-			log("ok", label .. " baixado (" .. #body .. "b)")
-			return body
+		local ok, res = pcall(function()
+			if httpReq then
+				local r = httpReq({ Url = url, Method = "GET", Timeout = CONFIG.httpTimeout })
+				if not r then error("sem resposta") end
+				if r.StatusCode and r.StatusCode >= 400 then
+					error("HTTP " .. r.StatusCode)
+				end
+				return r.Body
+			end
+			return game:HttpGetAsync(url)
+		end)
+		if ok and type(res) == "string" and #res > 0 then
+			if writefile then
+				pcall(writefile, cacheFile, res)
+				S.cacheWrites = S.cacheWrites + 1
+			end
+			return res
 		end
-		local reason = ok and "resposta invalida" or body
-		log("warn", label .. " falhou " .. attempt .. "/" .. CONFIG.retries .. ": " .. tostring(reason))
-		if attempt < CONFIG.retries then
-			task.wait(0.5 * (2 ^ (attempt - 1)) + math.random() * 0.25)
-		end
+		last = res
+		log("http", "retry " .. attempt .. " falhou")
+		task.wait(0.5 * (2 ^ (attempt - 1)))
 	end
-
-	if cached then
-		log("warn", label .. " usando cache antigo")
-		return cached
-	end
-	return nil
+	error("falha ao baixar " .. url .. " -> " .. tostring(last))
 end
 
-function Http.run(src, name)
-	if type(src) ~= "string" or #src == 0 then return false, "fonte vazia" end
-	local fn, err = loadstring(src, "=VolleyBomb/" .. name)
+local function loadChunk(src, name)
+	local fn, err = loadstring(src, name)
 	if not fn then
-		log("err", "compile " .. name .. ": " .. tostring(err))
-		return false, err
+		log("load", "sintaxe em " .. name .. ": " .. tostring(err))
+		return nil
 	end
 	local ok, res = pcall(fn)
 	if not ok then
-		log("err", "runtime " .. name .. ": " .. tostring(res))
-		return false, res
+		log("load", "erro em " .. name .. ": " .. tostring(res))
+		return nil
 	end
-	return true, res
-end-- stealth --------------------------------------------------------
-local function stealthParent()
-	local parent
-	if type(gethui) == "function" then
-		local ok, r = pcall(gethui)
-		if ok and r then parent = r end
+	return res
+end
+	
+--==== 1. KEY SYSTEM: REMOVIDO =================================
+_G.Key = rand(16)
+_G.KeyValid = true
+_G.KeyVerified = true
+_G.HasKey = true
+
+local KEYWORDS = { "key", "login", "auth", "verif", "whitelist" }
+
+local function isKeyName(name)
+	local n = tostring(name):lower()
+	for _, p in ipairs(KEYWORDS) do
+		if n:find(p, 1, true) then return true end
 	end
-	if not parent then
-		local ok, cg = pcall(function() return game:GetService("CoreGui") end)
-		if ok and cg then parent = cg end
-	end
-	if not parent then parent = LP:WaitForChild("PlayerGui") end
-	return parent
+	return false
 end
 
-local function protect(inst)
-	if type(protect_gui) == "function" then pcall(protect_gui, inst) end
-	if type(syn) == "table" and type(syn.protect_gui) == "function" then
-		pcall(syn.protect_gui, inst)
+local function looksLikeKey(gui)
+	local box, btn
+	for _, d in ipairs(gui:GetDescendants()) do
+		if d:IsA("TextBox") and not box then
+			box = d
+		elseif d:IsA("TextButton") and not btn then
+			btn = d
+		end
+	end
+	return (box and btn) and true or false, box, btn
+end
+
+local function fillAndConfirm(box, btn)
+	if box then
+		pcall(function()
+			if box.Text == "" then box.Text = rand(12) end
+			if firesignal then
+				pcall(firesignal, box.FocusLost)
+				pcall(firesignal, box.TextChanged, box.Text)
+			end
+		end)
+	end
+	task.wait(0.15)
+	if btn and firesignal then
+		pcall(firesignal, btn.MouseButton1Click)
+		pcall(firesignal, btn.Activated)
 	end
 end
 
--- snapshot -------------------------------------------------------
-local Snap = { data = nil }
-local reversals = 0
-
-function Snap.capture()
-	local char = LP.Character
-	local hum  = char and char:FindFirstChildOfClass("Humanoid")
-	local s = { at = os.time() }
-	if hum then
-		s.walk = hum.WalkSpeed
-		s.jump = hum.JumpPower or hum.JumpHeight
-		s.hip  = hum.HipHeight
-	end
-	if workspace.CurrentCamera then s.fov = workspace.CurrentCamera.FieldOfView end
-	s.gravity = workspace.Gravity
-	s.fog     = Lighting.FogEnd
-	s.bright  = Lighting.Brightness
-	Snap.data = s
-	log("info", "snapshot capturado")
-	return s
-end
-
-function Snap.restore()
-	local s = Snap.data
-	if not s then return end
-	local char = LP.Character
-	local hum  = char and char:FindFirstChildOfClass("Humanoid")
-	if hum then
-		if s.walk then pcall(function() hum.WalkSpeed = s.walk end) end
-		if s.jump then pcall(function()
-			if hum.JumpPower then hum.JumpPower = s.jump else hum.JumpHeight = s.jump end
-		end) end
-		if s.hip then pcall(function() hum.HipHeight = s.hip end) end
-	end
-	if s.fov and workspace.CurrentCamera then
-		pcall(function() workspace.CurrentCamera.FieldOfView = s.fov end)
-	end
-	if s.gravity then pcall(function() workspace.Gravity = s.gravity end) end
-	if s.fog then pcall(function() Lighting.FogEnd = s.fog end) end
-	if s.bright then pcall(function() Lighting.Brightness = s.bright end) end
-	reversals = reversals + 1
-	log("info", "snapshot restaurado")
-end
-
--- rate limiter ---------------------------------------------------
-local Rate = { budget = CONFIG.rateLimit, last = os.clock() }
-local function rateGate()
-	local now = os.clock()
-	Rate.budget = math.min(CONFIG.rateLimit, Rate.budget + (now - Rate.last) * CONFIG.rateLimit)
-	Rate.last = now
-	if Rate.budget >= 1 then
-		Rate.budget = Rate.budget - 1
-		return
-	end
-	local waitFor = (1 - Rate.budget) / CONFIG.rateLimit
-	Rate.budget = 0
-	task.wait(waitFor)
-end
-
--- anti-kick ------------------------------------------------------
-local Kick = { mode = 1, names = { "soft", "hard", "off" }, hits = 0 }
-local function kickMode() return Kick.names[Kick.mode] end
-local function cycleKick()
-	Kick.mode = (Kick.mode % #Kick.names) + 1
-	log("info", "anti-kick -> " .. kickMode())
-	return kickMode()
-end
-
-local mt = getrawmetatable and getrawmetatable(game)
-if mt then
-	local oldIndex    = mt.__index
-	local oldNamecall = mt.__namecall
-	local busy        = false
-
-	pcall(setreadonly, mt, false)
-
-	mt.__index = function(self, key)
-		local value = oldIndex(self, key)
-		if self == LP and key == "Kick" then
-			return function(inst, ...)
-				if Kick.mode == 3 then return value(inst, ...) end
-				Kick.hits = Kick.hits + 1
-				local msg = tostring((...))
-				log("warn", "kick interceptado: " .. msg)
-				notify("Kick interceptado", msg, 5)
-				if Kick.mode == 2 then return end
-				task.delay(1.5, function()
-					pcall(function()
-						Teleport:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
-					end)
-				end)
+local function sweepKeys()
+	local pg = LP and LP:FindFirstChild("PlayerGui")
+	if not pg then return end
+	local n = 0
+	for _, gui in ipairs(pg:GetChildren()) do
+		if gui:IsA("ScreenGui") then
+			local byName = isKeyName(gui.Name)
+			local heur, box, btn = looksLikeKey(gui)
+			if byName or heur then
+				fillAndConfirm(box, btn)
+				task.wait(0.2)
+				if gui.Parent then gui:Destroy() end
+				n = n + 1
+				log("key", "removido " .. gui.Name)
 			end
 		end
-		return value
 	end
-
-	mt.__namecall = function(self, ...)
-		if not checkcaller() then return oldNamecall(self, ...) end
-		local method = getnamecallmethod()
-		if busy then return oldNamecall(self, ...) end
-		if method == "FireServer" or method == "InvokeServer" then
-			busy = true
-			rateGate()
-			local r = oldNamecall(self, ...)
-			busy = false
-			return r
-		end
-		return oldNamecall(self, ...)
-	end
-
-	pcall(setreadonly, mt, true)
-
-	Api[#Api + 1] = function()
-		pcall(setreadonly, mt, false)
-		mt.__index    = oldIndex
-		mt.__namecall = oldNamecall
-		pcall(setreadonly, mt, true)
-	end
-	log("info", "hooks instalados")
-else
-	log("warn", "sem getrawmetatable: anti-kick e limiter desligados")
+	S.kills = S.kills + n
+	log("key", "varredura inicial: " .. n)
 end
 
--- watchdog anti-fling --------------------------------------------
-local Watch = { on = true, lastPos = nil, conn = nil, charConn = nil }
+local function watchKeys()
+	local pg = LP and LP:FindFirstChild("PlayerGui")
+	if not pg then return end
+	local conn = pg.ChildAdded:Connect(function(c)
+		if not S.alive or not c then return end
+		task.wait(0.4)
+		if not c.Parent or not c:IsA("ScreenGui") then return end
+		local byName = isKeyName(c.Name)
+		local heur, box, btn = looksLikeKey(c)
+		if byName or heur then
+			fillAndConfirm(box, btn)
+			task.wait(0.2)
+			if c.Parent then c:Destroy() end
+			S.kills = S.kills + 1
+			log("key", "capturado " .. c.Name)
+		end
+	end)
+	task.delay(CONFIG.keyWindow, function()
+		if conn then conn:Disconnect() end
+		log("key", "monitor encerrado (" .. S.kills .. " total)")
+	end)
+end
 
-local function clampVelocity(char)
-	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+--==== 2. STEALTH ==============================================
+local function hiddenParent()
+	if gethui then
+		local ok, h = pcall(gethui)
+		if ok and h then return h end
+	end
+	return game:GetService("CoreGui")
+end
+
+--==== 3. RATE LIMITER =========================================
+local lastCall = 0
+local checkcallerSafe = checkcaller or function() return true end
+
+local function pace()
+	local gap = 1 / CONFIG.rateLimit
+	local now = os.clock()
+	local d = lastCall + gap - now
+	if d > 0 then task.wait(d) end
+	lastCall = os.clock()
+end
+
+local function hookNamecall()
+	if not getrawmetatable or not setreadonly then return end
+	local ok, mt = pcall(getrawmetatable, game)
+	if not ok or not mt or not mt.__namecall then return end
+	local old = mt.__namecall
+	setreadonly(mt, false)
+	mt.__namecall = newcclosure(function(self, ...)
+		local m = getnamecallmethod()
+		if (m == "FireServer" or m == "InvokeServer") and checkcallerSafe() then
+			pace()
+		end
+		return old(self, ...)
+	end)
+	setreadonly(mt, true)
+	log("rate", "limite " .. CONFIG.rateLimit .. "/s ativo")
+end
+
+--==== 4. ANTI-KICK ============================================
+local function rejoin()
+	pcall(function()
+		game:GetService("TeleportService"):Teleport(game.PlaceId, LP)
+	end)
+end
+
+local kickHooked = {}
+
+local function wrapKick(player)
+	if kickHooked[player] then return end
+	if not getrawmetatable or not setreadonly then return end
+	local ok, pmt = pcall(getrawmetatable, player)
+	if not ok or not pmt or not pmt.__index or kickHooked[pmt] then return end
+	kickHooked[player] = true
+	kickHooked[pmt] = true
+	local old = pmt.__index
+	setreadonly(pmt, false)
+	pmt.__index = newcclosure(function(self, key)
+		local v = old(self, key)
+		if key == "Kick" and type(v) == "function" and self == LP then
+			return function(...)
+				if S.kickMode == "off" then return v(...) end
+				local args = { ... }
+				log("kick", "chamado: " .. tostring(args[1]))
+				S.reversals = S.reversals + 1
+				if S.kickMode == "hard" then
+					notify("Kick bloqueado")
+					return
+				end
+				pcall(v, ...)
+				notify("Kick soft: reconectando")
+				task.delay(0.8, rejoin)
+			end
+		end
+		return v
+	end)
+	setreadonly(pmt, true)
+end
+
+local function hookGameIndex()
+	if not getrawmetatable or not setreadonly then return end
+	local ok, mt = pcall(getrawmetatable, game)
+	if not ok or not mt or not mt.__index then return end
+	local old = mt.__index
+	setreadonly(mt, false)
+	mt.__index = newcclosure(function(self, key)
+		local v = old(self, key)
+		if key == "LocalPlayer" and self == game and typeof(v) == "Instance" then
+			pcall(wrapKick, v)
+		end
+		return v
+	end)
+	setreadonly(mt, true)
+	if LP then pcall(wrapKick, LP) end
+end
+
+--==== 5. ANTI-BAN =============================================
+local function snap()
+	local ch = LP and LP.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	local cam = workspace.CurrentCamera
+	S.snapshot = {
+		ws = hum and hum.WalkSpeed or 16,
+		jp = hum and hum.JumpPower or 50,
+		hip = hum and hum.HipHeight or 0,
+		fov = cam and cam.FieldOfView or 70,
+		grav = workspace.Gravity,
+		fogE = LIGHT.FogEnd,
+		fogS = LIGHT.FogStart,
+		fogC = LIGHT.FogColor,
+		bright = LIGHT.Brightness,
+	}
+end
+
+local function restore()
+	if S.restored or not S.snapshot then return end
+	S.restored = true
+	local s = S.snapshot
+	local ch = LP and LP.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	if hum then
+		pcall(function() hum.WalkSpeed = s.ws end)
+		pcall(function() hum.JumpPower = s.jp end)
+		pcall(function() hum.HipHeight = s.hip end)
+	end
+	if workspace.CurrentCamera then
+		pcall(function() workspace.CurrentCamera.FieldOfView = s.fov end)
+	end
+	pcall(function() workspace.Gravity = s.grav end)
+	pcall(function()
+		LIGHT.FogEnd = s.fogE
+		LIGHT.FogStart = s.fogS
+		LIGHT.FogColor = s.fogC
+		LIGHT.Brightness = s.bright
+	end)
+	log("ban", "estado restaurado")
+end
+
+--==== 6. ANTI-FLING / ANTI-TP-BACK =============================
+local flingConn
+local lastPos
+
+local function bindFling(char)
+	if flingConn then flingConn:Disconnect() end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		hrp = char:WaitForChild("HumanoidRootPart", 10)
+	end
 	if not hrp then return end
-	local v = hrp.AssemblyLinearVelocity
-	if v.Magnitude > CONFIG.maxVelocity then
-		hrp.AssemblyLinearVelocity = v.Unit * CONFIG.maxVelocity
-		log("warn", string.format("fling clampado: %.0f", v.Magnitude))
-	end
-	local pos = hrp.Position
-	if Watch.lastPos then
-		local delta = (pos - Watch.lastPos).Magnitude
-		if delta > CONFIG.snapStuds and v.Magnitude < 120 then
-			reversals = reversals + 1
-			log("warn", string.format("snap de servidor: %.0f studs", delta))
+	lastPos = hrp.Position
+	flingConn = RUN.Heartbeat:Connect(function()
+		if not S.alive or not S.flingOn or not hrp.Parent then return end
+		local v = hrp.AssemblyLinearVelocity
+		if v.Magnitude > CONFIG.clampVelocity then
+			hrp.AssemblyLinearVelocity = v.Unit * CONFIG.clampVelocity
 		end
-	end
-	Watch.lastPos = pos
+		local p = hrp.Position
+		local jump = (p - lastPos).Magnitude
+		if jump > 60 and v.Magnitude < 5 then
+			log("fling", "snap detectado " .. math.floor(jump))
+		end
+		lastPos = p
+	end)
 end
 
-Watch.charConn = LP.CharacterAdded:Connect(function(char)
-	Watch.lastPos = nil
-	log("info", "watchdog religado no personagem")
-	task.spawn(function() char:WaitForChild("HumanoidRootPart", 5) end)
-end)
-
-Watch.conn = RunService.Heartbeat:Connect(function()
-	if not Watch.on then return end
-	clampVelocity(LP.Character)
-end)
-
-Api[#Api + 1] = function()
-	if Watch.conn then Watch.conn:Disconnect() end
-	if Watch.charConn then Watch.charConn:Disconnect() end
-    end-- interface ------------------------------------------------------
-local UI = { root = nil, main = nil, body = nil, tabFrames = {}, tabButtons = {}, current = nil }
-local COL = {
-	bg      = Color3.fromRGB(16, 18, 24),
-	panel   = Color3.fromRGB(23, 26, 34),
-	panel2  = Color3.fromRGB(30, 34, 44),
-	stroke  = Color3.fromRGB(45, 50, 62),
-	text    = Color3.fromRGB(230, 232, 238),
-	dim     = Color3.fromRGB(139, 144, 160),
-	accent  = Color3.fromRGB(109, 94, 252),
-	accent2 = Color3.fromRGB(34, 211, 238),
-	ok      = Color3.fromRGB(52, 211, 153),
-	warn    = Color3.fromRGB(251, 191, 36),
-	err     = Color3.fromRGB(248, 113, 113),
-}
-
+local function hookFling()
+	PLR.CharacterAdded:Connect(function(c)
+		task.wait(0.5)
+		bindFling(c)
+	end)
+	if LP and LP.Character then bindFling(LP.Character) end
+	end
+	
+--==== 7. INTERFACE ============================================
 local function new(class, props, parent)
-	local inst = Instance.new(class)
-	for k, v in pairs(props or {}) do
-		if k ~= "Parent" then inst[k] = v end
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		if k ~= "Parent" then o[k] = v end
 	end
-	if parent then inst.Parent = parent end
-	return inst
+	o.Parent = parent
+	return o
 end
 
-local function corner(inst, r)
-	new("UICorner", { CornerRadius = UDim.new(0, r or 6) }, inst)
-end
+local BG      = Color3.fromRGB(16, 16, 20)
+local PANEL   = Color3.fromRGB(24, 24, 30)
+local SOFT    = Color3.fromRGB(34, 34, 42)
+local TXT     = Color3.fromRGB(235, 235, 242)
+local SUB     = Color3.fromRGB(140, 142, 158)
+local ACC1    = Color3.fromRGB(126, 92, 255)
+local ACC2    = Color3.fromRGB(0, 198, 255)
 
-local function stroke(inst, col)
-	new("UIStroke", { Color = col or COL.stroke, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, inst)
-end
-
-local root = new("ScreenGui", {
-	Name = GUI_NAME,
+local gui = new("ScreenGui", {
+	Name = S.guiName,
 	ResetOnSpawn = false,
 	IgnoreGuiInset = true,
-	DisplayOrder = 9999,
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-})
-protect(root)
-root.Parent = stealthParent()
-UI.root = root
+	DisplayOrder = 10000,
+}, hiddenParent())
 
-local main = new("Frame", {
-	Name = "vb",
-	Size = UDim2.fromOffset(430, 330),
-	Position = UDim2.new(0, 24, 0, 24),
-	BackgroundColor3 = COL.bg,
+if protect_gui then pcall(protect_gui, gui) end
+
+local panel = new("Frame", {
+	Name = "P",
+	Size = UDim2.fromOffset(342, 452),
+	Position = UDim2.new(0.5, 0, 0.5, 0),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundColor3 = BG,
 	BorderSizePixel = 0,
-}, root)
-corner(main, 10)
-stroke(main, COL.accent)
-UI.main = main
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, panel)
+new("UIStroke", { Thickness = 1, Color = ACC1, Transparency = 0.4 }, panel)
 
-local grad = new("UIGradient", {
-	Color = ColorSequence.new(COL.accent, COL.accent2),
-	Rotation = 0,
-}, main.UIStroke)
-main.UIStroke.Thickness = 1.5
-
-if UIS.TouchEnabled and not UIS.MouseEnabled then
-	new("UIScale", { Scale = 0.88 }, main)
-end
-
-local title = new("Frame", {
-	Name = "title",
+local topbar = new("Frame", {
 	Size = UDim2.new(1, 0, 0, 34),
-	BackgroundColor3 = COL.panel,
+	BackgroundColor3 = SOFT,
 	BorderSizePixel = 0,
-}, main)
-corner(title, 10)
-new("Frame", {
-	Size = UDim2.new(1, 0, 0, 12),
-	Position = UDim2.new(0, 0, 1, -12),
-	BackgroundColor3 = COL.panel,
-	BorderSizePixel = 0,
-}, title)
+}, panel)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, topbar)
+new("UIGradient", {
+	Color = ColorSequence.new(ACC1, ACC2),
+	Rotation = 90,
+	Transparency = NumberSequence.new(0.55),
+}, topbar)
 
-new("TextLabel", {
-	Size = UDim2.new(1, -84, 1, 0),
+local title = new("TextLabel", {
+	Size = UDim2.new(1, -80, 1, 0),
 	Position = UDim2.fromOffset(12, 0),
 	BackgroundTransparency = 1,
 	Font = Enum.Font.GothamBold,
 	TextSize = 13,
+	TextColor3 = TXT,
 	TextXAlignment = Enum.TextXAlignment.Left,
-	TextColor3 = COL.text,
-	Text = "VOLBOMB  v" .. VERSION,
-}, title)
+	Text = "VOLLEYBOMB  //  v2",
+}, topbar)
 
-local function titleBtn(txt, x, cb)
-	local b = new("TextButton", {
-		Size = UDim2.fromOffset(26, 22),
-		Position = UDim2.new(1, x, 0, 6),
-		BackgroundColor3 = COL.panel2,
-		BorderSizePixel = 0,
-		Font = Enum.Font.GothamBold,
-		TextSize = 12,
-		TextColor3 = COL.dim,
-		Text = txt,
-		AutoButtonColor = false,
-	}, title)
-	corner(b, 5)
-	b.MouseEnter:Connect(function() b.TextColor3 = COL.text end)
-	b.MouseLeave:Connect(function() b.TextColor3 = COL.dim end)
-	b.MouseButton1Click:Connect(cb)
-	return b
-end
-
-titleBtn("_", -62, function()
-	local collapsed = main:GetAttribute("min")
-	main:SetAttribute("min", not collapsed)
-	UI.body.Visible = collapsed
-	main.Size = collapsed and UDim2.fromOffset(430, 330) or UDim2.fromOffset(430, 34)
-end)
-titleBtn("x", -32, function() teardown() end)
-
--- arrasto
-do
-	local dragging, dragStart, startPos = false, nil, nil
-	title.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging, dragStart, startPos = true, i.Position, main.Position
-			i.Changed:Connect(function()
-				if i.UserInputState == Enum.UserInputState.End then dragging = false end
-			end)
-		end
-	end)
-	UIS.InputChanged:Connect(function(i)
-		if not dragging then return end
-		if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
-			local d = i.Position - dragStart
-			main.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + d.X,
-				startPos.Y.Scale, startPos.Y.Offset + d.Y
-			)
-		end
-	end)
-end
-
--- barra de progresso
-local progTrack = new("Frame", {
-	Size = UDim2.new(1, -24, 0, 3),
-	Position = UDim2.fromOffset(12, 38),
-	BackgroundColor3 = COL.panel2,
+local minBtn = new("TextButton", {
+	Size = UDim2.fromOffset(26, 22),
+	Position = UDim2.new(1, -62, 0, 6),
+	BackgroundColor3 = SOFT,
 	BorderSizePixel = 0,
-}, main)
-corner(progTrack, 2)
+	Font = Enum.Font.GothamBold,
+	TextSize = 14,
+	TextColor3 = SUB,
+	Text = "-",
+}, topbar)
+new("UICorner", { CornerRadius = UDim.new(0, 5) }, minBtn)
 
-local progFill = new("Frame", {
+local closeBtn = new("TextButton", {
+	Size = UDim2.fromOffset(26, 22),
+	Position = UDim2.new(1, -32, 0, 6),
+	BackgroundColor3 = SOFT,
+	BorderSizePixel = 0,
+	Font = Enum.Font.GothamBold,
+	TextSize = 13,
+	TextColor3 = Color3.fromRGB(255, 110, 110),
+	Text = "x",
+}, topbar)
+new("UICorner", { CornerRadius = UDim.new(0, 5) }, closeBtn)
+
+local barBg = new("Frame", {
+	Size = UDim2.new(1, -24, 0, 4),
+	Position = UDim2.fromOffset(12, 40),
+	BackgroundColor3 = SOFT,
+	BorderSizePixel = 0,
+}, panel)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, barBg)
+
+local barFill = new("Frame", {
 	Size = UDim2.new(0, 0, 1, 0),
-	BackgroundColor3 = COL.accent,
+	BackgroundColor3 = ACC2,
 	BorderSizePixel = 0,
-}, progTrack)
-corner(progFill, 2)
-new("UIGradient", { Color = ColorSequence.new(COL.accent, COL.accent2) }, progFill)
+}, barBg)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, barFill)
+new("UIGradient", { Color = ColorSequence.new(ACC1, ACC2) }, barFill)
 
-local function progress(frac, label)
-	TweenService:Create(progFill, TweenInfo.new(0.25), {
-		Size = UDim2.new(math.clamp(frac, 0, 1), 0, 1, 0),
+local status = new("TextLabel", {
+	Size = UDim2.new(1, -24, 0, 16),
+	Position = UDim2.fromOffset(12, 48),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Code,
+	TextSize = 11,
+	TextColor3 = SUB,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "iniciando",
+}, panel)
+
+local function setProgress(p, txt)
+	TS:Create(barFill, TweenInfo.new(0.25), {
+		Size = UDim2.new(math.clamp(p, 0, 1), 0, 1, 0),
 	}):Play()
-	if label then log("info", label) end
+	if txt then status.Text = txt end
 end
 
-local body = new("Frame", {
-	Size = UDim2.new(1, 0, 1, -46),
-	Position = UDim2.fromOffset(0, 44),
-	BackgroundTransparency = 1,
-}, main)
-UI.body = body
-
--- abas
 local tabBar = new("Frame", {
-	Size = UDim2.new(1, -16, 0, 26),
-	Position = UDim2.fromOffset(8, 0),
+	Size = UDim2.new(1, -24, 0, 24),
+	Position = UDim2.fromOffset(12, 68),
 	BackgroundTransparency = 1,
-}, body)
+}, panel)
 new("UIListLayout", {
 	FillDirection = Enum.FillDirection.Horizontal,
-	Padding = UDim.new(0, 3),
+	Padding = UDim.new(0, 4),
 	SortOrder = Enum.SortOrder.LayoutOrder,
 }, tabBar)
 
 local content = new("Frame", {
-	Size = UDim2.new(1, -16, 1, -30),
-	Position = UDim2.fromOffset(8, 28),
+	Size = UDim2.new(1, -24, 0, 246),
+	Position = UDim2.fromOffset(12, 98),
 	BackgroundTransparency = 1,
-}, body)
+}, panel)
 
-function UI.addTab(name)
+local consoleBg = new("Frame", {
+	Size = UDim2.new(1, -24, 0, 62),
+	Position = UDim2.new(0, 12, 1, -74),
+	BackgroundColor3 = Color3.fromRGB(12, 12, 15),
+	BorderSizePixel = 0,
+}, panel)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, consoleBg)
+
+S.console = new("ScrollingFrame", {
+	Size = UDim2.new(1, -8, 1, -8),
+	Position = UDim2.fromOffset(4, 4),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, consoleBg)
+new("UIListLayout", { Padding = UDim.new(0, 1) }, S.console)
+
+-- HUD
+local hud = new("TextLabel", {
+	Name = "HUD",
+	Size = UDim2.fromOffset(160, 20),
+	Position = UDim2.fromOffset(10, 10),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Code,
+	TextSize = 13,
+	TextColor3 = Color3.fromRGB(90, 240, 140),
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "FPS --  PING --",
+}, gui)
+
+-- abas
+local TABS = { "Home", "Player", "Visual", "Protecao", "Sessao", "Debug" }
+local pages = {}
+local activeTab
+
+local function openTab(name)
+	activeTab = name
+	for n, f in pairs(pages) do
+		f.Visible = (n == name)
+	end
+	for _, b in ipairs(tabBar:GetChildren()) do
+		if b:IsA("TextButton") then
+			b.BackgroundColor3 = (b.Text == name) and ACC1 or SOFT
+		end
+	end
+end
+
+for i, name in ipairs(TABS) do
 	local btn = new("TextButton", {
-		Size = UDim2.fromOffset(66, 24),
-		BackgroundColor3 = COL.panel,
+		Size = UDim2.fromOffset(49, 24),
+		BackgroundColor3 = SOFT,
 		BorderSizePixel = 0,
-		Font = Enum.Font.GothamSemibold,
-		TextSize = 11,
-		TextColor3 = COL.dim,
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		TextColor3 = TXT,
 		Text = name,
-		AutoButtonColor = false,
+		LayoutOrder = i,
 	}, tabBar)
-	corner(btn, 5)
+	new("UICorner", { CornerRadius = UDim.new(0, 5) }, btn)
+	btn.MouseButton1Click:Connect(function() openTab(name) end)
 
 	local page = new("ScrollingFrame", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
 		CanvasSize = UDim2.new(),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		ScrollBarThickness = 3,
-		ScrollBarImageColor3 = COL.stroke,
 		Visible = false,
 	}, content)
-	new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+	new("UIListLayout", { Padding = UDim.new(0, 5) }, page)
+	pages[name] = page
+end
 
-	local function select()
-		for _, b in pairs(UI.tabButtons) do
-			b.BackgroundColor3 = COL.panel
-			b.TextColor3 = COL.dim
-		end
-		for _, p in pairs(UI.tabFrames) do p.Visible = false end
-		btn.BackgroundColor3 = COL.panel2
-		btn.TextColor3 = COL.text
-		page.Visible = true
-		UI.current = name
+-- drag
+local drag, dragStart
+topbar.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1
+	or i.UserInputType == Enum.UserInputType.Touch then
+		drag = true
+		dragStart = i.Position
 	end
-
-	btn.MouseButton1Click:Connect(select)
-	btn.MouseEnter:Connect(function() if UI.current ~= name then btn.TextColor3 = COL.text end end)
-	btn.MouseLeave:Connect(function() if UI.current ~= name then btn.TextColor3 = COL.dim end end)
-
-	UI.tabButtons[#UI.tabButtons + 1] = btn
-	UI.tabFrames[#UI.tabFrames + 1] = page
-	return page, select
-end
-
--- console
-local consoleWrap = new("Frame", {
-	Size = UDim2.new(1, -16, 0, 74),
-	Position = UDim2.new(0, 8, 1, -82),
-	BackgroundColor3 = COL.panel,
-	BorderSizePixel = 0,
-}, body)
-corner(consoleWrap, 6)
-stroke(consoleWrap)
-
-local console = new("ScrollingFrame", {
-	Size = UDim2.new(1, -10, 1, -10),
-	Position = UDim2.fromOffset(5, 5),
-	BackgroundTransparency = 1,
-	BorderSizePixel = 0,
-	CanvasSize = UDim2.new(),
-	AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	ScrollBarThickness = 2,
-	ScrollBarImageColor3 = COL.stroke,
-}, consoleWrap)
-new("UIListLayout", { Padding = UDim.new(0, 1), SortOrder = Enum.SortOrder.LayoutOrder }, console)
-
-local consoleCount = 0
-local LEVEL_COLOR = { info = COL.dim, ok = COL.ok, warn = COL.warn, err = COL.err, cache = COL.accent2 }
-
-Log.bound = function(entry)
-	if consoleCount >= 140 then
-		local first = console:GetChildren()[1]
-		if first and first:IsA("TextLabel") then first:Destroy() end
-	else
-		consoleCount = consoleCount + 1
+end)
+UIS.InputChanged:Connect(function(i)
+	if drag and (i.UserInputType == Enum.UserInputType.MouseMovement
+	or i.UserInputType == Enum.UserInputType.Touch) then
+		local d = i.Position - dragStart
+		dragStart = i.Position
+		panel.Position = UDim2.new(
+			panel.Position.X.Scale, panel.Position.X.Offset + d.X,
+			panel.Position.Y.Scale, panel.Position.Y.Offset + d.Y
+		)
 	end
-	local line = new("TextLabel", {
-		Size = UDim2.new(1, 0, 0, 12),
+end)
+UIS.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1
+	or i.UserInputType == Enum.UserInputType.Touch then
+		drag = false
+	end
+end)
+
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	barBg.Visible = not minimized
+	status.Visible = not minimized
+	tabBar.Visible = not minimized
+	content.Visible = not minimized
+	consoleBg.Visible = not minimized
+	panel.Size = minimized and UDim2.fromOffset(342, 34) or UDim2.fromOffset(342, 452)
+	minBtn.Text = minimized and "+" or "-"
+end)
+
+local function destroy()
+	if not S.alive then return end
+	S.alive = false
+	pcall(function() restore() end)
+	pcall(function() if flingConn then flingConn:Disconnect() end end)
+	pcall(function() gui:Destroy() end)
+end
+S.destroy = destroy
+closeBtn.MouseButton1Click:Connect(destroy)
+
+-- HUD loop: fps por janela de 0.5s
+S.frames = 0
+RUN.RenderStepped:Connect(function()
+	S.frames = S.frames + 1
+end)
+task.spawn(function()
+	while S.alive do
+		task.wait(0.5)
+		local now = os.clock()
+		S.fps = math.floor(S.frames / math.max(now - S.win, 0.001))
+		S.frames = 0
+		S.win = now
+		local ping = 0
+		pcall(function()
+			ping = math.floor(STATS.Network.ServerStatsItem["Data Ping"]:GetValue())
+		end)
+		if S.hudOn then
+			hud.Visible = true
+			hud.Text = "FPS " .. S.fps .. "  PING " .. ping
+			hud.TextColor3 = (S.fps < 30)
+				and Color3.fromRGB(255, 90, 90)
+				or Color3.fromRGB(90, 240, 140)
+		else
+			hud.Visible = false
+		end
+	end
+end)
+
+log("gui", "painel em " .. gui.Parent.Name .. " / " .. gui.Name)--==== 8. COMPONENTES ==========================================
+local function row(parent, label)
+	local f = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 26),
+		BackgroundColor3 = PANEL,
+		BorderSizePixel = 0,
+	}, parent)
+	new("UICorner", { CornerRadius = UDim.new(0, 5) }, f)
+	new("TextLabel", {
+		Size = UDim2.new(1, -90, 1, 0),
+		Position = UDim2.fromOffset(8, 0),
 		BackgroundTransparency = 1,
-		Font = Enum.Font.Code,
-		TextSize = 10,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextColor3 = SUB,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		TextColor3 = LEVEL_COLOR[entry.lvl] or COL.dim,
-		Text = "[" .. entry.t .. "] " .. entry.msg,
-	}, console)
-	task.defer(function()
-		console.CanvasPosition = Vector2.new(0, math.max(0, console.AbsoluteCanvasSize.Y - console.AbsoluteWindowSize.Y))
-		line.Size = UDim2.new(1, 0, 0, line.TextBounds.Y)
-	end)
+		Text = label,
+	}, f)
+	return f
 end
 
-for _, e in ipairs(Log.buffer) do Log.bound(e) end
-
--- HUD
-local hud = new("Frame", {
-	Size = UDim2.fromOffset(112, 24),
-	Position = UDim2.new(0, 24, 0, 362),
-	BackgroundColor3 = COL.bg,
-	BorderSizePixel = 0,
-}, root)
-corner(hud, 6)
-stroke(hud)
-
-local hudFps = new("TextLabel", {
-	Size = UDim2.new(0.5, 0, 1, 0),
-	BackgroundTransparency = 1,
-	Font = Enum.Font.Code,
-	TextSize = 11,
-	TextColor3 = COL.ok,
-	Text = "FPS --",
-}, hud)
-local hudPing = new("TextLabel", {
-	Size = UDim2.new(0.5, 0, 1, 0),
-	Position = UDim2.new(0.5, 0, 0, 0),
-	BackgroundTransparency = 1,
-	Font = Enum.Font.Code,
-	TextSize = 11,
-	TextColor3 = COL.dim,
-	Text = "PING --",
-}, hud)
-
-do
-	local frames, acc = 0, 0
-	RunService.RenderStepped:Connect(function(dt)
-		frames = frames + 1
-		acc = acc + dt
-		if acc >= 0.5 then
-			local fps = math.floor(frames / acc)
-			frames, acc = 0, 0
-			hudFps.Text = "FPS " .. fps
-			hudFps.TextColor3 = fps < 30 and COL.err or (fps < 50 and COL.warn or COL.ok)
-		end
-	end)
-
-	task.spawn(function()
-		while alive do
-			task.wait(1)
-			local ok, v = pcall(function()
-				return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
-			end)
-			hudPing.Text = "PING " .. (ok and math.floor(v) or "?")
-			hudPing.TextColor3 = (ok and v > 220) and COL.warn or COL.dim
-		end
-	end)
-        end-- widgets --------------------------------------------------------
-function UI.section(page, text)
-	local l = new("TextLabel", {
-		Size = UDim2.new(1, 0, 0, 16),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.GothamBold,
-		TextSize = 10,
-		TextColor3 = COL.accent2,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = string.upper(text),
-	}, page)
-	return l
-end
-
-function UI.button(page, text, cb)
+local function button(parent, label, color, cb)
 	local b = new("TextButton", {
 		Size = UDim2.new(1, 0, 0, 26),
-		BackgroundColor3 = COL.panel,
+		BackgroundColor3 = color or SOFT,
 		BorderSizePixel = 0,
-		Font = Enum.Font.GothamSemibold,
+		Font = Enum.Font.GothamBold,
 		TextSize = 11,
-		TextColor3 = COL.text,
-		Text = text,
+		TextColor3 = TXT,
+		Text = label,
 		AutoButtonColor = false,
-	}, page)
-	corner(b, 5)
-	stroke(b)
-
-	local function paint(col, txt)
-		TweenService:Create(b, TweenInfo.new(0.12), {
-			BackgroundColor3 = col, TextColor3 = txt,
-		}):Play()
-	end
-
-	b.MouseEnter:Connect(function() paint(COL.panel2, COL.accent2) end)
-	b.MouseLeave:Connect(function() paint(COL.panel, COL.text) end)
+	}, parent)
+	new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
+	b.MouseEnter:Connect(function()
+		TS:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = ACC1 }):Play()
+	end)
+	b.MouseLeave:Connect(function()
+		TS:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = color or SOFT }):Play()
+	end)
 	b.MouseButton1Click:Connect(function()
-		paint(COL.accent, COL.text)
-		task.delay(0.15, function() paint(COL.panel, COL.text) end)
-		task.spawn(cb)
+		log("ui", label)
+		local ok, err = pcall(cb)
+		if not ok then log("ui", "erro: " .. tostring(err)) end
 	end)
 	return b
 end
 
-function UI.row(page, label, default, cb)
-	local row = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 26),
-		BackgroundColor3 = COL.panel,
-		BorderSizePixel = 0,
-	}, page)
-	corner(row, 5)
-	stroke(row)
-
-	new("TextLabel", {
-		Size = UDim2.new(1, -84, 1, 0),
-		Position = UDim2.fromOffset(8, 0),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Gotham,
-		TextSize = 11,
-		TextColor3 = COL.dim,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = label,
-	}, row)
-
+local function input(parent, label, default, cb)
+	local f = row(parent, label)
 	local box = new("TextBox", {
-		Size = UDim2.fromOffset(70, 20),
-		Position = UDim2.new(1, -78, 0, 3),
-		BackgroundColor3 = COL.panel2,
+		Size = UDim2.fromOffset(66, 20),
+		Position = UDim2.new(1, -72, 0, 3),
+		BackgroundColor3 = BG,
 		BorderSizePixel = 0,
 		Font = Enum.Font.Code,
 		TextSize = 11,
-		TextColor3 = COL.text,
-		Text = tostring(default or ""),
+		TextColor3 = TXT,
+		Text = tostring(default),
+		PlaceholderText = "...",
 		ClearTextOnFocus = false,
-	}, row)
-	corner(box, 4)
-
+	}, f)
+	new("UICorner", { CornerRadius = UDim.new(0, 4) }, box)
 	box.FocusLost:Connect(function()
 		local n = tonumber(box.Text)
-		if n then task.spawn(cb, n) else box.Text = tostring(default or "") end
-	end)
-	return box, row
-end
-
-function UI.toggle(page, label, default, cb)
-	local state = default and true or false
-	local row = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 26),
-		BackgroundColor3 = COL.panel,
-		BorderSizePixel = 0,
-	}, page)
-	corner(row, 5)
-	stroke(row)
-
-	new("TextLabel", {
-		Size = UDim2.new(1, -60, 1, 0),
-		Position = UDim2.fromOffset(8, 0),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Gotham,
-		TextSize = 11,
-		TextColor3 = COL.dim,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = label,
-	}, row)
-
-	local pill = new("Frame", {
-		Size = UDim2.fromOffset(38, 18),
-		Position = UDim2.new(1, -46, 0, 4),
-		BackgroundColor3 = state and COL.ok or COL.panel2,
-		BorderSizePixel = 0,
-	}, row)
-	corner(pill, 9)
-
-	local knob = new("Frame", {
-		Size = UDim2.fromOffset(14, 14),
-		Position = UDim2.fromOffset(state and 22 or 2, 2),
-		BackgroundColor3 = COL.text,
-		BorderSizePixel = 0,
-	}, pill)
-	corner(knob, 7)
-
-	local hit = new("TextButton", {
-		Size = UDim2.fromScale(1, 1),
-		BackgroundTransparency = 1,
-		Text = "",
-	}, pill)
-
-	hit.MouseButton1Click:Connect(function()
-		state = not state
-		TweenService:Create(pill, TweenInfo.new(0.15), {
-			BackgroundColor3 = state and COL.ok or COL.panel2,
-		}):Play()
-		TweenService:Create(knob, TweenInfo.new(0.15), {
-			Position = UDim2.fromOffset(state and 22 or 2, 2),
-		}):Play()
-		task.spawn(cb, state)
-	end)
-	return row
-            end-- ações ----------------------------------------------------------
-local function applySpeed(v) local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid"); if h then pcall(function() h.WalkSpeed = v end) end end
-local function applyJump(v) local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid"); if h then pcall(function()
-	if h.JumpPower then h.JumpPower = v else h.JumpHeight = v end
-end) end end
-local function applyHip(v) local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid"); if h then pcall(function() h.HipHeight = v end) end end
-local function applyFov(v) if workspace.CurrentCamera then pcall(function() workspace.CurrentCamera.FieldOfView = v end) end end
-
-local function fullbright(on)
-	pcall(function()
-		Lighting.Brightness = on and 2 or Snap.data and Snap.data.bright or 1
-		Lighting.Ambient = on and Color3.fromRGB(160, 160, 160) or Color3.fromRGB(70, 70, 70)
-	end)
-end
-
-local function nofog(on)
-	pcall(function()
-		Lighting.FogEnd = on and 100000 or (Snap.data and Snap.data.fog or 1000)
-	end)
-end
-
-local function unlockFps()
-	pcall(function() setfpscap(CONFIG.fpsCap) end)
-	log("info", "fps cap -> " .. CONFIG.fpsCap)
-end
-
-local function rejoin()
-	log("info", "rejoin " .. tostring(game.JobId))
-	pcall(function() Teleport:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP) end)
-end
-
-local function serverHop()
-	log("info", "buscando servidores")
-	local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"
-	local ok, raw = pcall(function() return game:HttpGet(url) end)
-	if not ok then return notify("Hop", "falha no fetch", 4) end
-	local dec = pcall(function() return HttpService:JSONDecode(raw) end)
-	if not dec then return notify("Hop", "json invalido", 4) end
-	local data = HttpService:JSONDecode(raw)
-	local pool = {}
-	for _, s in ipairs(data.data or {}) do
-		if s.id ~= game.JobId and (s.playing or 0) < (s.maxPlayers or 0) then
-			pool[#pool + 1] = s.id
+		if n then
+			local ok, err = pcall(cb, n)
+			if not ok then log("ui", "erro: " .. tostring(err)) end
+		else
+			log("ui", label .. ": valor invalido")
 		end
-	end
-	if #pool == 0 then return notify("Hop", "nenhum servidor livre", 4) end
-	local pick = pool[math.random(1, #pool)]
-	log("info", "hop -> " .. pick)
-	pcall(function() Teleport:TeleportToPlaceInstance(game.PlaceId, pick, LP) end)
+	end)
+	return box
 end
 
-local function copyJob()
-	pcall(function() setclipboard(tostring(game.JobId)) end)
-	notify("JobId", tostring(game.JobId), 3)
-end
+--==== 9. HOME =================================================
+local home = pages.Home
 
-local function copyDiscord()
-	pcall(function() setclipboard("https://discord.gg/askvenice") end)
-	notify("Discord", "link copiado", 3)
-end
-
-local function clearCache()
-	if type(isfolder) ~= "function" or type(delfile) ~= "function" then
-		return notify("Cache", "sem filesystem", 3)
-	end
-	if not isfolder(CONFIG.cacheDir) then return notify("Cache", "ja vazio", 3) end
-	local n = 0
-	local ok, files = pcall(listfiles, CONFIG.cacheDir)
-	if ok then
-		for _, f in ipairs(files) do
-			if pcall(delfile, f) then n = n + 1 end
-		end
-	end
-	log("info", "cache limpo: " .. n .. " arquivo(s)")
-end
-
-local function checkUpdate()
-	local body = Http.get(SELF, "self", { bypass = true })
-	if not body then return notify("Update", "falha no fetch", 4) end
-	local remote = body:match("VERSION%s*=%s*[\"']([%d%.]+)[\"']")
-	if not remote then return notify("Update", "marcador ausente", 4) end
-	if remote == VERSION then
-		notify("Update", "atualizado (" .. VERSION .. ")", 4)
-	else
-		notify("Update", "nova: " .. remote .. " | atual: " .. VERSION, 6)
-	end
-end
-
-local function dumpEnv()
-	local function id()
-		if type(identifyexecutor) ~= "function" then return "?" end
-		local ok, a, b = pcall(identifyexecutor)
-		return ok and (tostring(a) .. " " .. tostring(b)) or "?"
-	end
-	local lines = {
-		"volleybomb " .. VERSION,
-		"executor: " .. id(),
-		"placeId: " .. tostring(game.PlaceId),
-		"jobId: " .. tostring(game.JobId),
-		"gethui: " .. tostring(type(gethui) == "function"),
-		"protect_gui: " .. tostring(type(protect_gui) == "function"),
-		"getrawmetatable: " .. tostring(type(getrawmetatable) == "function"),
-		"filesystem: " .. tostring(fsReady()),
-		"kick mode: " .. kickMode(),
-		"reversals: " .. reversals,
-		"uptime: " .. (os.time() - G[STATE_KEY].startedAt) .. "s",
-	}
-	pcall(function() setclipboard(table.concat(lines, "\n")) end)
-	log("info", "ambiente copiado")
-	notify("Dump", "copiado para o clipboard", 3)
-end
-
-local function reloadSelf()
-	log("info", "recarregando loader")
-	local src = Http.get(SELF, "self", { bypass = true })
-	if not src then return notify("Reload", "falha no fetch", 4) end
-	teardown()
-	task.wait(0.2)
-	local fn = loadstring(src, "=VolleyBomb/reload")
-	if fn then pcall(fn) end
-end
-
-local function panic()
-	Snap.restore()
-	Watch.on = false
-	notify("Panic", "estado revertido", 3)
-                end-- abas -----------------------------------------------------------
-local home, selHome = UI.addTab("Home")
-UI.section(home, "sessao")
-new("TextLabel", {
-	Size = UDim2.new(1, 0, 0, 30),
-	BackgroundTransparency = 1,
-	Font = Enum.Font.Gotham,
-	TextSize = 10,
+local info = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 44),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Font = Enum.Font.Code,
+	TextSize = 11,
+	TextColor3 = SUB,
 	TextWrapped = true,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	TextColor3 = COL.dim,
-	Text = "Loader independente. O painel do jogo roda abaixo e a varredura de key limpa a tela sozinha.",
+	Text = "loader ativo\nstealth: " .. gui.Parent.Name .. " / " .. gui.Name,
 }, home)
-UI.button(home, "Recarregar loader", reloadSelf)
-UI.button(home, "Rejoin", rejoin)
-UI.button(home, "Server Hop", serverHop)
-UI.button(home, "Discord (clipboard)", copyDiscord)
+new("UICorner", { CornerRadius = UDim.new(0, 5) }, info)
 
-local player, selPlayer = UI.addTab("Player")
-UI.section(player, "corpo")
-UI.row(player, "WalkSpeed", 16, applySpeed)
-UI.row(player, "JumpPower", 50, applyJump)
-UI.row(player, "HipHeight", 2, applyHip)
-UI.section(player, "camera")
-UI.row(player, "FieldOfView", 70, applyFov)
-UI.button(player, "Reset", function()
-	local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-	if h then pcall(function() h.Health = 0 end) end
-end)
-UI.button(player, "Spawn (respawn)", function()
-	if LP.Character then pcall(function() LP.Character:BreakJoints() end) end
+button(home, "Verificar atualizacao", SOFT, function()
+	local ok, err = pcall(function()
+		local remote = fetch(VOL .. "Loading.lua")
+		local ok2, cur = pcall(function() return game:HttpGetAsync(VOL .. "Loading.lua") end)
+		log("update", "remoto " .. #remote .. " bytes")
+		if ok2 and type(cur) == "string" then
+			log("update", (#cur == #remote) and "sem mudanca" or "divergente")
+		end
+	end)
+	if not ok then log("update", err) end
 end)
 
-local visual, selVisual = UI.addTab("Visual")
-UI.section(visual, "luz")
-UI.toggle(visual, "Fullbright", false, fullbright)
-UI.toggle(visual, "Sem fog", false, nofog)
-UI.section(visual, "desempenho")
-UI.toggle(visual, "HUD FPS/Ping", true, function(on) hud.Visible = on end)
-UI.button(visual, "Desbloquear FPS (" .. CONFIG.fpsCap .. ")", unlockFps)
+button(home, "Discord (copiar)", SOFT, function()
+	setclipboard(CONFIG.discord)
+	notify("Convite copiado")
+end)
 
-local prot, selProt = UI.addTab("Protecao")
-UI.section(prot, "anti-kick")
+button(home, "Recarregar loader", ACC1, function()
+	log("reload", "re-baixando")
+	local ok, src = pcall(fetch, VOL .. "Loading.lua")
+	if not ok then
+		log("reload", src)
+		return
+	end
+	destroy()
+	task.wait(0.4)
+	local fn = loadstring(src, "vb_reload")
+	if fn then
+		local ok2, err = pcall(fn)
+		if not ok2 then notify("falhou: " .. tostring(err)) end
+	end
+end)
+
+button(home, "Limpar cache", SOFT, function()
+	if not listfiles then
+		log("cache", "executor sem listfiles")
+		return
+	end
+	local n = 0
+	for _, f in ipairs(listfiles()) do
+		if f:match("vb_%w+%.lua$") and isfile(f) then
+			pcall(delfile, f)
+			n = n + 1
+		end
+	end
+	log("cache", n .. " arquivos removidos")
+end)
+
+button(home, "Panic (restaurar tudo)", Color3.fromRGB(150, 60, 60), function()
+	restore()
+	S.flingOn = false
+	log("panic", "reversao aplicada (" .. S.reversals .. ")")
+end)
+
+--==== 10. PLAYER ==============================================
+local player = pages.Player
+
+local function hum()
+	local c = LP and LP.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+input(player, "WalkSpeed", 16, function(n)
+	snap()
+	local h = hum()
+	if h then h.WalkSpeed = math.clamp(n, 0, 2000) end
+end)
+
+input(player, "JumpPower", 50, function(n)
+	snap()
+	local h = hum()
+	if h then h.JumpPower = math.clamp(n, 0, 2000) end
+end)
+
+input(player, "HipHeight", 0, function(n)
+	snap()
+	local h = hum()
+	if h then h.HipHeight = math.clamp(n, -50, 500) end
+end)
+
+button(player, "Reset", SOFT, function()
+	local h = hum()
+	if h then h.Health = 0 end
+end)
+
+button(player, "Spawn (LoadCharacter)", SOFT, function()
+	LP:LoadCharacter()
+end)
+
+button(player, "Restaurar defaults", SOFT, function()
+	restore()
+	S.restored = false
+end)
+
+--==== 11. VISUAL ==============================================
+local visual = pages.Visual
+
+input(visual, "FieldOfView", 70, function(n)
+	snap()
+	if workspace.CurrentCamera then
+		workspace.CurrentCamera.FieldOfView = math.clamp(n, 1, 120)
+	end
+end)
+
+button(visual, "Fullbright", SOFT, function()
+	snap()
+	LIGHT.Brightness = 3
+	LIGHT.ClockTime = 14
+	LIGHT.FogEnd = 100000
+	log("visual", "fullbright on")
+end)
+
+button(visual, "No-Fog", SOFT, function()
+	snap()
+	LIGHT.FogEnd = 100000
+	LIGHT.FogStart = 100000
+end)
+
+button(visual, "HUD on/off", SOFT, function()
+	S.hudOn = not S.hudOn
+	log("visual", "hud " .. tostring(S.hudOn))
+end)
+
+button(visual, "FPS unlock (" .. CONFIG.fpsCap .. ")", SOFT, function()
+	if setfpscap then
+		setfpscap(CONFIG.fpsCap)
+		log("visual", "cap " .. CONFIG.fpsCap)
+	else
+		log("visual", "setfpscap indisponivel")
+	end
+end)
+
+--==== 12. PROTECAO ============================================
+local protec = pages.Protecao
+
 local kickLabel = new("TextLabel", {
 	Size = UDim2.new(1, 0, 0, 22),
 	BackgroundTransparency = 1,
-	Font = Enum.Font.GothamSemibold,
+	Font = Enum.Font.Code,
 	TextSize = 11,
-	TextColor3 = COL.warn,
-	Text = "modo: " .. kickMode(),
-}, prot)
-UI.button(prot, "Ciclar modo de kick", function()
-	kickLabel.Text = "modo: " .. cycleKick()
-end)
-UI.section(prot, "anti-fling")
-UI.toggle(prot, "Watchdog de velocidade", true, function(on) Watch.on = on end)
-UI.section(prot, "estado")
-UI.button(prot, "Capturar snapshot", function() Snap.capture() end)
-UI.button(prot, "Panic (restaurar tudo)", panic)
+	TextColor3 = SUB,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "anti-kick: " .. S.kickMode,
+}, protec)
 
-local session, selSession = UI.addTab("Sessao")
-UI.section(session, "auditoria")
-local sessLabel = new("TextLabel", {
-	Size = UDim2.new(1, 0, 0, 54),
+button(protec, "Ciclar modo anti-kick", SOFT, function()
+	local order = { "soft", "hard", "off" }
+	local idx = 1
+	for i, v in ipairs(order) do
+		if v == S.kickMode then idx = i end
+	end
+	S.kickMode = order[(idx % #order) + 1]
+	kickLabel.Text = "anti-kick: " .. S.kickMode
+	log("kick", "modo " .. S.kickMode)
+end)
+
+local flingLabel = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 22),
 	BackgroundTransparency = 1,
 	Font = Enum.Font.Code,
-	TextSize = 10,
+	TextSize = 11,
+	TextColor3 = SUB,
 	TextXAlignment = Enum.TextXAlignment.Left,
-	TextColor3 = COL.dim,
-	Text = "",
-}, session)
+	Text = "anti-fling: ativo (clamp " .. CONFIG.clampVelocity .. ")",
+}, protec)
+
+button(protec, "Ligar/desligar anti-fling", SOFT, function()
+	S.flingOn = not S.flingOn
+	flingLabel.Text = "anti-fling: " .. (S.flingOn and "ativo" or "desligado")
+end)
+
+button(protec, "Re-verificar keys agora", SOFT, function()
+	sweepKeys()
+end)
+
+button(protec, "Snapshot manual", SOFT, function()
+	snap()
+	S.restored = false
+	log("ban", "snapshot salvo")
+end)
+
+button(protec, "Restaurar snapshot", SOFT, function()
+	restore()
+	S.restored = false
+end)
+
+local revLabel = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 22),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Code,
+	TextSize = 11,
+	TextColor3 = Color3.fromRGB(255, 190, 90),
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "reversoes: 0",
+}, protec)
+
 task.spawn(function()
-	while alive do
-		sessLabel.Text = string.format(
-			"uptime   %ds\nreversoes %d\nkicks    %d\nmodo     %s",
-			os.time() - G[STATE_KEY].startedAt, reversals, Kick.hits, kickMode()
-		)
+	while S.alive do
+		revLabel.Text = "reversoes: " .. S.reversals .. "  |  keys: " .. S.kills
+		task.wait(0.5)
+	end
+end)
+
+--==== 13. SESSAO ==============================================
+local sess = pages.Sessao
+
+local function uptime()
+	local s = math.floor(os.clock() - START)
+	return string.format("%02d:%02d:%02d", s // 3600, (s % 3600) // 60, s % 60)
+end
+
+local sessLabel = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 60),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Font = Enum.Font.Code,
+	TextSize = 11,
+	TextColor3 = SUB,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextWrapped = true,
+	Text = "",
+}, sess)
+new("UICorner", { CornerRadius = UDim.new(0, 5) }, sess)
+
+task.spawn(function()
+	while S.alive do
+		sessLabel.Text = "uptime: " .. uptime()
+			.. "\njobId: " .. tostring(game.JobId)
+			.. "\nplace: " .. tostring(game.PlaceId)
+			.. "\nreversoes: " .. S.reversals
+			.. "\ncache: " .. S.cacheHits .. " hit / " .. S.cacheWrites .. " write"
 		task.wait(1)
 	end
 end)
-UI.button(session, "Copiar JobId", copyJob)
 
-local debugTab, selDebug = UI.addTab("Debug")
-UI.section(debugTab, "diagnostico")
-UI.button(debugTab, "Dump de ambiente", dumpEnv)
-UI.button(debugTab, "Verificar update", checkUpdate)
-UI.button(debugTab, "Limpar cache", clearCache)
-UI.section(debugTab, "perigo")
-UI.button(debugTab, "Encerrar loader", function() teardown() end)
+button(sess, "Copiar JobId", SOFT, function()
+	setclipboard(tostring(game.JobId))
+	notify("JobId copiado")
+end)
 
-selHome()-- key system -----------------------------------------------------
-local Key = { kills = 0 }
-local KEY_WORDS = { "key", "login", "auth", "verif", "whitelist", "licen" }
-
-local function isKeyName(name)
-	local n = tostring(name):lower()
-	for _, w in ipairs(KEY_WORDS) do
-		if n:find(w, 1, true) then return true end
+button(sess, "Server Hop", ACC1, function()
+	if not httpReq and not game.HttpGetAsync then
+		log("hop", "sem HTTP")
+		return
 	end
-	return false
-end
-
-local function findOfClass(root, class)
-	for _, d in ipairs(root:GetDescendants()) do
-		if d:IsA(class) and d.Visible then return d end
-	end
-	return nil
-end
-
-local function fire(sig, ...)
-	if not sig then return end
-	pcall(function() sig:Fire(...) end)
-end
-
-local function candidateKey()
-	local v = (getgenv and getgenv().Key) or _G.Key
-	if type(v) == "string" and #v > 3 then return v end
-	return randStr(24)
-end
-
-local function moveOut(gui)
-	if not gui or not gui.Parent then return end
-	local p = stealthParent()
-	if gui.Parent == p then return end
-	pcall(function() gui.Name = randStr(math.random(9, 14)) end)
-	protect(gui)
-	pcall(function() gui.Parent = p end)
-end
-
-local function killKey(gui)
-	local box = findOfClass(gui, "TextBox")
-	local btn = findOfClass(gui, "TextButton")
-	local val = candidateKey()
-
-	if box then
-		pcall(function()
-			box.Text = val
-			box:CaptureFocus()
-			task.wait(0.06)
-			box:ReleaseFocus()
-			fire(box.FocusLost, true, "\r")
-			fire(box.ReturnPressedFromOnScreenKeyboard)
-		end)
-	end
-
-	if btn then
-		pcall(function()
-			fire(btn.MouseButton1Click)
-			fire(btn.MouseButton1Down)
-			fire(btn.TouchTap)
-			fire(btn.Activated)
-		end)
-	end
-
-	task.wait(0.45)
-	Key.kills = Key.kills + 1
-	log("warn", "key gui removida: " .. tostring(gui.Name))
-	pcall(function() gui:Destroy() end)
-end
-
--- camada 1: flags globais
-_G.Key = candidateKey()
-_G.KeyValid  = true
-_G.KeyVerified = true
-_G.HasKey    = true
-getgenv().Key = _G.Key
-log("info", "flags de key semeadas")
-
--- camadas 2 e 3: varredura + monitor de 20s
-local pg = LP:WaitForChild("PlayerGui")
-local seen = {}
-
-local function consider(gui)
-	if not gui:IsA("ScreenGui") then return end
-	if seen[gui] then return end
-	if gui:GetAttribute("VB_Own") or gui.Name == GUI_NAME then return end
-	seen[gui] = true
-
-	local keyish = isKeyName(gui.Name)
-		or (findOfClass(gui, "TextBox") and findOfClass(gui, "TextButton"))
-
-	if keyish then
-		killKey(gui)
-	else
-		moveOut(gui)
-	end
-end
-
-for _, g in ipairs(pg:GetChildren()) do
-	pcall(consider, g)
-end
-
-local monitorConn = pg.DescendantAdded:Connect(function(d)
-	pcall(function()
-		local gui = d
-		while gui and gui.Parent and gui.Parent ~= pg do gui = gui.Parent end
-		if gui and gui.Parent == pg then consider(gui) end
+	local url = "https://games.roblox.com/v1/games/"
+		.. game.PlaceId
+		.. "/servers/Public?sortOrder=Asc&limit=100"
+	local ok, body = pcall(function()
+		if httpReq then
+			local r = httpReq({ Url = url, Method = "GET", Timeout = 10 })
+			return r and r.Body
+		end
+		return game:HttpGetAsync(url)
 	end)
-end)
-
-task.delay(CONFIG.keyMonitorSeconds, function()
-	if monitorConn then monitorConn:Disconnect() end
-	log("info", "monitor de key encerrado (" .. Key.kills .. " removida(s))")
-end)
-
-Api[#Api + 1] = function() if monitorConn then monitorConn:Disconnect() end end-- bootstrap ------------------------------------------------------
-Snap.capture()
-progress(0.05, "snapshot capturado")
-
-local isMobile = UIS.TouchEnabled and not UIS.MouseEnabled
-local uiFile, scriptFile
-
-if CONFIG.useRemoteLoader then
-	progress(0.1, "detectando plataforma via loader remoto")
-	local detected = Http.get(RAW .. "Loader.lua", "loader")
-	if detected then
-		local ok, res = Http.run(detected, "loader")
-		if ok and (res == "PC" or res == "Mobile") then
-			isMobile = res == "Mobile"
+	if not ok or not body then
+		log("hop", "falha na API")
+		return
+	end
+	local dec = (syn and syn.json and syn.json.decode)
+		or (HttpService and HttpService.JSONDecode)
+		or (http and http.json and http.json.decode)
+		or function() return nil end
+	local data
+	pcall(function()
+		if HttpService then
+			data = game:GetService("HttpService"):JSONDecode(body)
+		else
+			data = dec(body)
+		end
+	end)
+	if not data or not data.data then
+		log("hop", "resposta invalida")
+		return
+	end
+	local pool = {}
+	for _, srv in ipairs(data.data) do
+		if srv.id ~= game.JobId and srv.playing < srv.maxPlayers then
+			table.insert(pool, srv.id)
 		end
 	end
-end
-
-if isMobile then
-	uiFile, scriptFile = "Mobile.lua", "Mobile%20Script.lua"
-else
-	uiFile, scriptFile = "PC.lua", "PC%20Script.lua"
-end
-log("info", "plataforma: " .. (isMobile and "mobile" or "pc"))
-
-progress(0.2, "baixando interface")
-local uiSrc = Http.get(UI_BASE .. uiFile, "ui")
-if uiSrc then
-	progress(0.5, "executando interface")
-	task.spawn(function() Http.run(uiSrc, "ui") end)
-else
-	log("err", "interface indisponivel")
-end
-
-task.wait(0.2)
-
-progress(0.65, "baixando payload")
-local payload = Http.get(RAW .. scriptFile, "payload")
-if payload then
-	progress(0.85, "executando payload")
-	task.spawn(function()
-		local ok, err = Http.run(payload, "payload")
-		progress(1, ok and "payload carregado" or ("falha: " .. tostring(err)))
-		if not ok then notify("Payload", "erro na execucao, veja o console", 6) end
+	if #pool == 0 then
+		log("hop", "nenhum servidor livre")
+		notify("Nenhum servidor disponivel")
+		return
+	end
+	local pick = pool[math.random(1, #pool)]
+	log("hop", "indo para " .. pick:sub(1, 8) .. " (" .. #pool .. " opcoes)")
+	pcall(function()
+		game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, pick, LP)
 	end)
-else
-	progress(1, "payload indisponivel")
-	notify("Payload", "nao foi possivel baixar", 6)
+end)
+
+--==== 14. DEBUG ===============================================
+local dbg = pages.Debug
+
+local function envDump()
+	local lines = {
+		"executor: " .. tostring(identifyexecutor and identifyexecutor() or "?"),
+		"versao: " .. tostring(getexecutorname and getexecutorname() or "?"),
+		"uptime: " .. uptime(),
+		"fps: " .. S.fps,
+		"place: " .. tostring(game.PlaceId),
+		"jobId: " .. tostring(game.JobId),
+		"gethui: " .. tostring(gethui ~= nil),
+		"protect_gui: " .. tostring(protect_gui ~= nil),
+		"setfpscap: " .. tostring(setfpscap ~= nil),
+		"getrawmetatable: " .. tostring(getrawmetatable ~= nil),
+		"firesignal: " .. tostring(firesignal ~= nil),
+		"writefile: " .. tostring(writefile ~= nil),
+		"state key: " .. SKEY,
+		"gui name: " .. S.guiName,
+	}
+	return table.concat(lines, "\n")
 end
 
-task.delay(1.2, function() progress(0) end)
+local dumpLabel = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 190),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+	Font = Enum.Font.Code,
+	TextSize = 10,
+	TextColor3 = SUB,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	TextWrapped = true,
+	Text = "",
+}, dbg)
+new("UICorner", { CornerRadius = UDim.new(0, 5) }, dumpLabel)
 
--- encerramento ---------------------------------------------------
-Api[#Api + 1] = function()
-	if UI.root then pcall(function() UI.root:Destroy() end) end
+button(dbg, "Dump ambiente", SOFT, function()
+	dumpLabel.Text = envDump()
+end)
+
+button(dbg, "Copiar dump", SOFT, function()
+	setclipboard(envDump())
+	notify("Dump copiado")
+end)
+
+button(dbg, "Log completo", SOFT, function()
+	setclipboard(table.concat(S.logs, "\n"))
+	notify(#S.logs .. " linhas copiadas")
+end)
+
+button(dbg, "Destruir instancia", Color3.fromRGB(150, 60, 60), function()
+	destroy()
+end)
+
+openTab("Home")
+
+--==== 15. BOOT ================================================
+local function boot()
+	setProgress(0.05, "setando flags de key")
+	log("boot", "flags _G setadas")
+
+	task.wait(0.2)
+	setProgress(0.15, "varrendo PlayerGui")
+	sweepKeys()
+	watchKeys()
+
+	setProgress(0.3, "instalando hooks")
+	pcall(hookNamecall)
+	pcall(hookGameIndex)
+	pcall(hookFling)
+	snap()
+	log("boot", "hooks instalados")
+
+	if setfpscap then pcall(setfpscap, CONFIG.fpsCap) end
+
+	setProgress(0.45, "baixando Loader.lua")
+	local okL, loaderSrc = pcall(fetch, VOL .. "Loader.lua")
+	local platform = "PC"
+	if okL then
+		local out = loadChunk(loaderSrc, "vb_loader")
+		if out == "Mobile" then
+			platform = "Mobile"
+		end
+		log("boot", "plataforma: " .. platform)
+	else
+		log("boot", "Loader.lua falhou, assumindo PC")
+	end
+
+	setProgress(0.6, "carregando interface original")
+	local uiUrl = (platform == "Mobile") and (UIC .. "Mobile.lua") or (UIC .. "PC.lua")
+	local okU, uiSrc = pcall(fetch, uiUrl)
+	if okU then
+		loadChunk(uiSrc, "vb_ui")
+	else
+		log("boot", uiSrc)
+	end
+
+	setProgress(0.8, "carregando script original")
+	local scUrl = (platform == "Mobile") and (VOL .. "Mobile%20Script.lua") or (VOL .. "PC%20Script.lua")
+	local okS, scSrc = pcall(fetch, scUrl)
+	if okS then
+		loadChunk(scSrc, "vb_script")
+	else
+		log("boot", scSrc)
+	end
+
+	setProgress(1, "pronto")
+	log("boot", "concluido em " .. string.format("%.2fs", os.clock() - START))
+	notify("VolleyBomb carregado (" .. platform .. ")")
 end
 
 task.spawn(function()
-	while alive do
-		task.wait(2)
-		if UI.root and not UI.root.Parent then
-			-- executor limpou a árvore: encerra sem quebrar
-			teardown()
-			break
-		end
+	local ok, err = pcall(boot)
+	if not ok then
+		log("boot", "falha geral: " .. tostring(err))
+		setProgress(1, "falhou - veja o console")
 	end
 end)
-
-notify("VolleyBomb", VERSION .. " pronto | key: " .. kickMode(), 4)
-log("ok", "inicializado")
