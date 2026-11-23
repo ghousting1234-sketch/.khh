@@ -1,38 +1,28 @@
 --!nocheck
 --[[==================================================================
-    VolleyBomb :: Loading.lua  (v3 - Hardened)
-    --------------------------------------------------------------
-    Camadas:
-      L1  Stealth   -> GUI em gethui(), nome aleatorio, sem PlayerGui
-      L2  Anti-Kick -> hook de __namecall/__index em LocalPlayer:Kick
-      L3  Anti-Ban  -> snapshot/restore, rate limit de remotes, safe mode
-      L4  Anti-AC   -> anti-fling, anti-teleport-back, watchdog de Humanoid
-      L5  Utilidade -> player/visual/sessao/debug + Panic (kill switch)
-    Key system: removido (bypass em 3 camadas)
+    VolleyBomb :: Loading.lua  (v3.1)
+    Fix principal: fim do "endlocal" -> primitivas de UI no topo
+    Extras: pcall(buildUI)+buildFallbackUI, UIScale por viewport
 ==================================================================]]--
 
-local VERSION = "3.0.0"
+local VERSION = "3.1.0"
 
 local CONFIG = {
-    -- rede
     RetryCount = 3, RetryDelay = 0.6, Timeout = 20,
     UseCache = true, CacheDir = "VolleyBomb/cache/",
-    -- recursos
     DisableKeySystem = true, UnlockFPS = true, AntiAFK = true,
-    AntiFling = true, AntiKick = true, AutoRejoin = true,
+    AntiFling = true, AntiTP = true, AntiKick = true, AutoRejoin = true,
     SafeMode = true, ShowHUD = true, ShowLog = true,
-    CloseDelay = 1.4,
-    -- limites
+    CloseDelay = 20,
     RemoteBudgetPerSec = 45,
     FlingVelocityCap = 900,
     TPThreshold = 30,
-    -- links
     Discord = "https://discord.gg/volleybomb",
     REPO = "https://raw.githubusercontent.com/Biskus0/VolleyBomb/refs/heads/main/",
     UIC  = "https://raw.githubusercontent.com/Biskus0/UIConstructor/refs/heads/main/",
+    SELF = "https://raw.githubusercontent.com/ghousting1234-sketch/.khh/refs/heads/main/Loading.lua",
 }
 
---==================== utilidades basicas =========================--
 local Players      = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInput    = game:GetService("UserInputService")
@@ -42,10 +32,17 @@ local HttpService  = game:GetService("HttpService")
 local VirtualUser  = game:GetService("VirtualUser")
 local Lighting     = game:GetService("Lighting")
 local Workspace    = game:GetService("Workspace")
+local StarterGui   = game:GetService("StarterGui")
 
 local LP = Players.LocalPlayer
 local IS_MOBILE = UserInput.TouchEnabled and not UserInput.KeyboardEnabled
 local PLATFORM = IS_MOBILE and "Mobile" or "PC"
+
+local clamp = math.clamp or function(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
 
 local genv = getgenv or function() return _G end
 
@@ -55,18 +52,15 @@ local function rnd(n)
     return table.concat(s)
 end
 
--- estado escondido sob chave aleatoria (nao fica em _G.VolleyBomb)
 local STATE_KEY = "__vb_" .. rnd(10)
 local S = {
     dead = false, conns = {}, hooks = {},
     remotes = 0, remoteWindow = os.clock(),
     lastKick = nil, reverted = 0, snaps = {},
-    antiKickMode = "soft", -- soft | hard | off
+    antiKickMode = "soft",
     ui = nil, hud = nil, logBox = nil, status = nil, bar = nil,
 }
-genv()[STATE_KEY] = S
-
-local function log(...)
+genv()[STATE_KEY] = Slocal function log(...)
     local msg = table.concat({...}, " ")
     if S.status then pcall(function() S.status.Text = msg end) end
     if S.logBox then
@@ -80,9 +74,11 @@ local function log(...)
             l.TextColor3 = Color3.fromRGB(140, 148, 162)
             l.Text = ("%s  %s"):format(os.date("%H:%M:%S"), msg)
             l.Parent = S.logBox
-            S.logBox.CanvasSize = UDim2.new(0, 0, 0, #S.logBox:GetChildren() * 15)
             local sc = S.logBox.Parent
-            if sc then task.defer(function() pcall(function() sc.CanvasPosition = Vector2.new(0, 1e5) end) end) end
+            if sc then
+                sc.CanvasSize = UDim2.new(0, 0, 0, #S.logBox:GetChildren() * 15)
+                task.defer(function() pcall(function() sc.CanvasPosition = Vector2.new(0, 1e5) end) end)
+            end
         end)
     end
     print("[VolleyBomb]", msg)
@@ -90,7 +86,7 @@ end
 
 local function progress(a)
     if S.bar then
-        TweenService:Create(S.bar, TweenInfo.new(0.25), {Size = UDim2.new(math.clamp(a, 0, 1), 0, 1, 0)}):Play()
+        TweenService:Create(S.bar, TweenInfo.new(0.25), {Size = UDim2.new(clamp(a, 0, 1), 0, 1, 0)}):Play()
     end
 end
 
@@ -113,9 +109,9 @@ local function tween(obj, time, props)
     local t = TweenService:Create(obj, TweenInfo.new(time, Enum.EasingStyle.Quad), props)
     t:Play()
     return t
-end--==================== stealth de montagem ========================--
+end
+
 local function mount(gui)
-    -- gethui() tira a GUI da PlayerGui: enumeracao de PlayerGui nao acha
     if gethui then
         pcall(function() gui.Parent = gethui() end)
     end
@@ -123,7 +119,6 @@ local function mount(gui)
         pcall(function() gui.Parent = game:GetService("CoreGui") end)
     end
     if not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
-    -- protect_gui (Synapse/Fluxus/Aquarium) esconde de getinstances/debug.getregistry
     pcall(function()
         if syn and syn.protect_gui then syn.protect_gui(gui) end
         if getgenv().protect_gui then getgenv().protect_gui(gui) end
@@ -131,7 +126,12 @@ local function mount(gui)
     end)
 end
 
---==================== rede =======================================--
+local function safe(name, fn)
+    local ok, err = pcall(fn)
+    if not ok then log("Falha em " .. name .. ": " .. tostring(err)) end
+    return ok
+end
+
 local function cachePath(url)
     return CONFIG.CacheDir .. (url:gsub("[^%w]", "_"):sub(-120)) .. ".lua"
 end
@@ -162,15 +162,13 @@ local function httpGet(url)
         end)
         if ok and type(body) == "string" and #body > 0 then return body end
         lastErr = body
-        log(("Retry %d/%d -> %s"):format(a, CONFIG.RetryCount, url:match("[^/]+$")))
+        log(("Retry %d/%d -> %s"):format(a, CONFIG.RetryCount, tostring(url:match("[^/]+$"))))
         task.wait(CONFIG.RetryDelay * a)
     end
     return nil, lastErr
-end
-
---==================== rate limiter de remotes ====================--
+end--==================== camadas ====================================--
 local function installRateLimiter()
-    if not hookmetamethod or not getnamecallmethod then return end
+    if not hookmetamethod or not getnamecallmethod or not newcclosure then return end
     local ok = pcall(function()
         local mt = getrawmetatable(game)
         local oldName = mt.__namecall
@@ -195,16 +193,17 @@ local function installRateLimiter()
         S.hooks.namecall = oldName
     end)
     if ok then log("Rate limiter de remotes ativo") end
-end--==================== anti-kick ==================================--
+end
+
 local function installAntiKick()
-    if not CONFIG.AntiKick or not getrawmetatable then return end
+    if not CONFIG.AntiKick or not getrawmetatable or not newcclosure then return end
     local ok = pcall(function()
         local mt = getrawmetatable(game)
         local oldIdx = mt.__index
         setreadonly(mt, false)
         mt.__index = newcclosure(function(self, k)
             local v = oldIdx(self, k)
-            if self == LP and k == "Kick" and type(v) == "function" and not S.hooks.kickWrapped then
+            if self == LP and k == "Kick" and type(v) == "function" then
                 S.hooks.kickWrapped = true
                 return newcclosure(function(_, reason)
                     S.lastKick = tostring(reason)
@@ -232,7 +231,6 @@ local function installAntiKick()
     if ok then log("Anti-Kick armado (soft)") end
 end
 
---==================== snapshot / restore =========================--
 local function snapshot()
     local ch = LP.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -264,11 +262,10 @@ local function restore()
     end)
 end
 
---==================== anti-fling / anti-tp =======================--
 local function installCharacterWatch()
     local function hookChar(ch)
         local hrp = ch:WaitForChild("HumanoidRootPart", 6)
-        local hum = ch:WaitForChildOfClass and ch:WaitForChildOfClass("Humanoid") or ch:FindFirstChildOfClass("Humanoid")
+        local hum = ch:FindFirstChildOfClass("Humanoid")
         if not hrp or not hum then return end
         local lastPos = hrp.Position
         local lastT = os.clock()
@@ -279,7 +276,6 @@ local function installCharacterWatch()
             local now = os.clock()
             local dt = now - lastT
 
-            -- anti-fling
             if CONFIG.AntiFling and hrp.AssemblyLinearVelocity.Magnitude > CONFIG.FlingVelocityCap then
                 pcall(function()
                     hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity.Unit * CONFIG.FlingVelocityCap
@@ -287,7 +283,6 @@ local function installCharacterWatch()
                 end)
             end
 
-            -- anti-teleport-back (snap do servidor)
             if CONFIG.AntiTP and dt > 0.1 then
                 local moved = (p - lastPos).Magnitude
                 if moved > CONFIG.TPThreshold and hrp.AssemblyLinearVelocity.Magnitude < 5 then
@@ -306,10 +301,7 @@ local function installCharacterWatch()
 
     if LP.Character then hookChar(LP.Character) end
     bind(LP.CharacterAdded, hookChar)
-end
-
---==================== anti-afk ===================================--
-local function installAntiAFK()
+endlocal function installAntiAFK()
     if not CONFIG.AntiAFK then return end
     bind(LP.Idled, function()
         pcall(function()
@@ -317,7 +309,8 @@ local function installAntiAFK()
             VirtualUser:ClickButton2(Vector2.new())
         end)
     end)
-end--==================== bypass de key ==============================--
+end
+
 local function installKeyBypass()
     if not CONFIG.DisableKeySystem then return end
     genv().Key, _G.Key = true, true
@@ -359,7 +352,76 @@ local function installKeyBypass()
     task.delay(20, function() pcall(function() c:Disconnect() end) end)
 end
 
---==================== HUD ========================================--
+--==================== primitivas de UI (topo) ====================--
+local function mkBtn(parent, text, cb, w)
+    local b = new("TextButton", {
+        Size = UDim2.new(w or 1, 0, 0, 26), LayoutOrder = #parent:GetChildren(),
+        BackgroundColor3 = Color3.fromRGB(30, 30, 38), BorderSizePixel = 0,
+        Font = Enum.Font.GothamMedium, TextSize = 11,
+        TextColor3 = Color3.fromRGB(215, 215, 228), Text = text,
+        AutoButtonColor = false,
+    }, parent)
+    corner(b, 6)
+    b.MouseEnter:Connect(function() tween(b, 0.15, {BackgroundColor3 = Color3.fromRGB(45, 45, 58)}) end)
+    b.MouseLeave:Connect(function() tween(b, 0.15, {BackgroundColor3 = Color3.fromRGB(30, 30, 38)}) end)
+    b.MouseButton1Click:Connect(function() pcall(cb) end)
+    return b
+end
+
+local function mkInput(parent, label, default, apply)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+        LayoutOrder = #parent:GetChildren(),
+    }, parent)
+    new("TextLabel", {
+        Size = UDim2.new(0.55, 0, 1, 0), BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = Color3.fromRGB(180, 185, 200),
+        TextXAlignment = Enum.TextXAlignment.Left, Text = label,
+    }, row)
+    local tb = new("TextBox", {
+        Size = UDim2.new(0.28, 0, 1, 0), Position = UDim2.new(0.55, 0, 0, 0),
+        BackgroundColor3 = Color3.fromRGB(22, 22, 28), BorderSizePixel = 0,
+        Font = Enum.Font.Code, TextSize = 11, TextColor3 = Color3.fromRGB(230, 230, 240),
+        Text = tostring(default), ClearTextOnFocus = false,
+    }, row)
+    corner(tb, 5)
+    local ab = new("TextButton", {
+        Size = UDim2.new(0.15, -4, 1, 0), Position = UDim2.new(0.85, 0, 0, 0),
+        BackgroundColor3 = Color3.fromRGB(55, 45, 110), BorderSizePixel = 0,
+        Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = Color3.fromRGB(225, 225, 240),
+        Text = "set", AutoButtonColor = false,
+    }, row)
+    corner(ab, 5)
+    ab.MouseButton1Click:Connect(function()
+        pcall(function() apply(tonumber(tb.Text) or tb.Text) end)
+    end)
+    return row
+end
+
+local function mkInfo(parent, label, fn)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1,
+        LayoutOrder = #parent:GetChildren(),
+    }, parent)
+    new("TextLabel", {
+        Size = UDim2.new(0.5, 0, 1, 0), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, TextSize = 10, TextColor3 = Color3.fromRGB(120, 125, 140),
+        TextXAlignment = Enum.TextXAlignment.Left, Text = label,
+    }, row)
+    local v = new("TextLabel", {
+        Size = UDim2.new(0.5, 0, 1, 0), Position = UDim2.new(0.5, 0, 0, 0),
+        BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 10,
+        TextColor3 = Color3.fromRGB(200, 205, 220),
+        TextXAlignment = Enum.TextXAlignment.Left, Text = tostring(fn()),
+    }, row)
+    task.spawn(function()
+        while row.Parent do
+            task.wait(1)
+            pcall(function() v.Text = tostring(fn()) end)
+        end
+    end)
+    return row
+end--==================== HUD ========================================--
 local function buildHUD()
     local gui = new("ScreenGui", {
         Name = rnd(9), ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 998,
@@ -403,7 +465,9 @@ local function buildHUD()
             lbl.TextColor3 = acc < 30 and Color3.fromRGB(255, 130, 130) or Color3.fromRGB(170, 215, 180)
         end
     end)
-end--==================== UI =========================================--
+end
+
+--==================== UI principal ==============================--
 local function buildUI()
     local gui = new("ScreenGui", {
         Name = rnd(11), ResetOnSpawn = false, IgnoreGuiInset = true,
@@ -421,6 +485,19 @@ local function buildUI()
     }, gui)
     corner(panel, 12)
     new("UIStroke", {Color = Color3.fromRGB(42, 42, 52), Thickness = 1}, panel)
+
+    local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+    local scale = math.min(1, (vp.X - 24) / 460, (vp.Y - 60) / 400)
+    scale = clamp(scale, 0.55, 1)
+    local uiscale = new("UIScale", {Scale = scale}, panel)
+
+    pcall(function()
+        bind(Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), function()
+            local vp2 = Workspace.CurrentCamera.ViewportSize
+            local s2 = math.min(1, (vp2.X - 24) / 460, (vp2.Y - 60) / 400)
+            uiscale.Scale = clamp(s2, 0.55, 1)
+        end)
+    end)
 
     local top = new("Frame", {
         Size = UDim2.new(1, 0, 0, 3),
@@ -449,7 +526,6 @@ local function buildUI()
         Text = ("%s  ·  stealth on  ·  key off"):format(PLATFORM),
     }, panel)
 
-    -- barra de progresso
     local bg = new("Frame", {
         Size = UDim2.new(1, -32, 0, 4),
         Position = UDim2.new(0, 16, 0, 56),
@@ -470,7 +546,6 @@ local function buildUI()
         Text = "Iniciando...",
     }, panel)
 
-    -- abas
     local tabBar = new("Frame", {
         Size = UDim2.new(1, -32, 0, 26),
         Position = UDim2.new(0, 16, 0, 84),
@@ -487,6 +562,7 @@ local function buildUI()
     corner(content, 8)
 
     local pages = {}
+
     local function page(name, order)
         local b = new("TextButton", {
             Size = UDim2.new(0, 66, 1, 0), LayoutOrder = order,
@@ -515,4 +591,413 @@ local function buildUI()
             end
         end)
         return f
+endlocal home = page("Home", 1)
+    mkBtn(home, "Rejoin", function()
+        pcall(Teleport.TeleportToPlaceInstance, Teleport, game.PlaceId, game.JobId, LP)
+    end)
+    mkBtn(home, "Server Hop", function()
+        task.spawn(function()
+            local ok, res = pcall(function()
+                return HttpService:JSONDecode(game:HttpGet(
+                    ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(game.PlaceId)))
+            end)
+            if not ok or not res or not res.data then return log("Hop: sem resposta") end
+            local pool = {}
+            for _, s in ipairs(res.data) do
+                if s.playing < s.maxPlayers and s.id ~= game.JobId then table.insert(pool, s.id) end
+            end
+            if #pool == 0 then return log("Hop: nenhum livre") end
+            log(("Hop: %d candidatos"):format(#pool))
+            pcall(Teleport.TeleportToPlaceInstance, Teleport, game.PlaceId, pool[math.random(#pool)], LP)
+        end)
+    end)
+    mkBtn(home, "Copiar Discord", function()
+        if setclipboard then setclipboard(CONFIG.Discord) end
+        log("Discord copiado")
+    end)
+    mkBtn(home, "Recarregar script", function()
+        local src = httpGet(CONFIG.SELF)
+        panic(true)
+        task.wait(0.4)
+        if src then loadstring(src)() end
+    end)
+    mkBtn(home, "Limpar cache", function()
+        if not (isfolder and listfiles and delfile) then return log("Sem file I/O") end
+        for _, f in ipairs(listfiles(CONFIG.CacheDir) or {}) do pcall(delfile, f) end
+        log("Cache limpo")
+    end)
+    mkBtn(home, "PANIC — desfazer tudo", function() panic() end)
+
+    local pl = page("Player", 2)
+    mkInput(pl, "WalkSpeed", 16, function(v)
+        local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if h and type(v) == "number" then h.WalkSpeed = v; log("WS = " .. v) end
+    end)
+    mkInput(pl, "JumpPower", 50, function(v)
+        local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if h and type(v) == "number" then
+            h.UseJumpPower = true
+            h.JumpPower = v
+            log("JP = " .. v)
+        end
+    end)
+    mkInput(pl, "HipHeight", 2, function(v)
+        local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if h and type(v) == "number" then h.HipHeight = v; log("Hip = " .. v) end
+    end)
+    mkBtn(pl, "Resetar personagem", function()
+        local h = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if h then h.Health = 0 end
+    end)
+    mkBtn(pl, "Ir para o spawn", function()
+        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local sp = Workspace:FindFirstChildOfClass("SpawnLocation")
+            if sp then hrp.CFrame = sp.CFrame + Vector3.new(0, 4, 0) end
+        end
+    end)
+    mkBtn(pl, "Anti-fling: alternar", function()
+        CONFIG.AntiFling = not CONFIG.AntiFling
+        log("Anti-fling " .. (CONFIG.AntiFling and "ON" or "OFF"))
+    end)
+    mkBtn(pl, "Anti-TP: alternar", function()
+        CONFIG.AntiTP = not CONFIG.AntiTP
+        log("Anti-TP " .. (CONFIG.AntiTP and "ON" or "OFF"))
+    end)
+
+    local vis = page("Visual", 3)
+    mkInput(vis, "Field of View", 70, function(v)
+        if Workspace.CurrentCamera and type(v) == "number" then
+            Workspace.CurrentCamera.FieldOfView = v
+            log("FOV = " .. v)
+        end
+    end)
+    mkBtn(vis, "Fullbright: alternar", function()
+        if Lighting.Brightness > 2 then
+            restore()
+            log("Fullbright OFF")
+        else
+            Lighting.Brightness = 3
+            Lighting.FogEnd = 1e5
+            log("Fullbright ON")
+        end
+    end)
+    mkBtn(vis, "Sem fog: alternar", function()
+        Lighting.FogEnd = Lighting.FogEnd > 5000 and 400 or 1e5
+        log("FogEnd = " .. math.floor(Lighting.FogEnd))
+    end)
+    mkBtn(vis, "HUD FPS/Ping: alternar", function()
+        if S.hud then S.hud:Destroy(); S.hud = nil; log("HUD OFF")
+        else buildHUD(); log("HUD ON") end
+    end)
+    mkBtn(vis, "Desbloquear FPS", function()
+        if setfpscap then setfpscap(240); log("fpscap = 240")
+        else log("Executor sem setfpscap") end
+    end)
+
+    local pr = page("Proteção", 4)
+    mkBtn(pr, "Anti-Kick: soft / hard / off", function()
+        local m = S.antiKickMode
+        S.antiKickMode = (m == "soft" and "hard") or (m == "hard" and "off") or "soft"
+        log("Anti-Kick = " .. S.antiKickMode)
+    end)
+    mkBtn(pr, "Auto-Rejoin: alternar", function()
+        CONFIG.AutoRejoin = not CONFIG.AutoRejoin
+        log("Auto-Rejoin " .. (CONFIG.AutoRejoin and "ON" or "OFF"))
+    end)
+    mkBtn(pr, "Safe Mode (rate limit): alternar", function()
+        CONFIG.SafeMode = not CONFIG.SafeMode
+        log("Safe Mode " .. (CONFIG.SafeMode and "ON" or "OFF"))
+    end)
+    mkBtn(pr, "Anti-AFK: alternar", function()
+        CONFIG.AntiAFK = not CONFIG.AntiAFK
+        log("Anti-AFK " .. (CONFIG.AntiAFK and "ON" or "OFF"))
+    end)
+    mkBtn(pr, "Snapshot do estado", function() snapshot(); log("Snapshot salvo") end)
+    mkBtn(pr, "Restaurar estado", function() restore(); log("Estado restaurado") end)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham, TextSize = 10, TextWrapped = true,
+        TextColor3 = Color3.fromRGB(130, 135, 150),
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "Safe Mode espaca FireServer/InvokeServer para reduzir flag em anti-cheat por volume. Anti-Kick hard bloqueia a chamada local (o servidor ainda pode derrubar).",
+        LayoutOrder = 99,
+    }, pr)
+
+    local se = page("Sessão", 5)
+    mkInfo(se, "usuario", function() return LP.Name end)
+    mkInfo(se, "userId", function() return LP.UserId end)
+    mkInfo(se, "placeId", function() return game.PlaceId end)
+    mkInfo(se, "jobId", function() return (game.JobId ~= "" and game.JobId:sub(1, 13)) or "-" end)
+    mkInfo(se, "uptime", function() return math.floor(os.clock()) .. "s" end)
+    mkInfo(se, "revertidos", function() return S.reverted end)
+    mkInfo(se, "ultimo kick", function() return S.lastKick or "-" end)
+    mkBtn(se, "Copiar JobId", function()
+        if setclipboard then setclipboard(game.JobId) end
+        log("JobId copiado")
+    end)
+
+    local db = page("Debug", 6)
+    mkBtn(db, "Rodar modulo UI", function()
+        local url = CONFIG.UIC .. (IS_MOBILE and "Mobile.lua" or "PC.lua")
+        log("Testando UI...")
+        local src = httpGet(url)
+        if src and loadstring(src) then log("UI ok (" .. #src .. " bytes)") else log("UI falhou") end
+    end)
+    mkBtn(db, "Verificar atualizacao", function()
+        task.spawn(function()
+            local src = httpGet(CONFIG.SELF)
+            if not src then return log("Sem conexao") end
+            local v = src:match('VERSION%s*=%s*"([%d%.]+)"')
+            log(v and (v == VERSION and "Atualizado" or ("Nova versao: " .. v)) or "Versao nao detectada")
+        end)
+    end)
+    mkBtn(db, "Dump do ambiente", function()
+        local ok, res = pcall(function()
+            local t = {}
+            for k in pairs(genv()) do
+                if type(k) == "string" and #t < 40 then table.insert(t, k) end
+            end
+            return table.concat(t, ", ")
+        end)
+        log(ok and res or "dump falhou")
+    end)
+    mkBtn(db, "Destruir HUD", function()
+        if S.hud then S.hud:Destroy(); S.hud = nil end
+        log("HUD removido")
+    end)
+
+    if CONFIG.ShowLog then
+        local sc = new("ScrollingFrame", {
+            Size = UDim2.new(1, -32, 0, 52),
+            Position = UDim2.new(0, 16, 1, -60),
+            BackgroundColor3 = Color3.fromRGB(10, 10, 13),
+            BorderSizePixel = 0, ScrollBarThickness = 3,
+            CanvasSize = UDim2.new(0, 0, 0, 0),
+        }, panel)
+        corner(sc, 6)
+        S.logBox = new("Frame", {Size = UDim2.new(1, -6, 1, 0), BackgroundTransparency = 1}, sc)
+        new("UIListLayout", {Padding = UDim.new(0, 1), SortOrder = Enum.SortOrder.LayoutOrder}, S.logBox)
+endlocal min = new("TextButton", {
+        Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -34, 0, 10),
+        BackgroundColor3 = Color3.fromRGB(30, 30, 38), BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = Color3.fromRGB(205, 205, 215),
+        Text = "-", AutoButtonColor = false,
+    }, panel)
+    corner(min, 5)
+
+    local minimized = false
+    min.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        if minimized then
+            tween(panel, 0.2, {Size = UDim2.new(0, 150, 0, 34), Position = UDim2.new(0, 16, 0, 16), AnchorPoint = Vector2.zero})
+            for _, c in ipairs(panel:GetDescendants()) do
+                if c:IsA("Frame") or c:IsA("ScrollingFrame") or c:IsA("TextLabel") or c:IsA("TextButton") then
+                    if c ~= panel then c.Visible = false end
+                end
+            end
+            min.Text, min.Visible = "+", true
+        else
+            tween(panel, 0.2, {Size = UDim2.new(0, 460, 0, 400), Position = UDim2.fromScale(0.5, 0.5), AnchorPoint = Vector2.new(0.5, 0.5)})
+            for _, c in ipairs(panel:GetDescendants()) do
+                if c:IsA("Frame") or c:IsA("ScrollingFrame") or c:IsA("TextLabel") or c:IsA("TextButton") then c.Visible = true end
+            end
+            min.Text = "-"
+            for k, p in pairs(pages) do p.Visible = (k == "Home") end
+        end
+    end)
+
+    local dragging, dragStart, startPos
+    panel.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, panel.Position
+        end
+    end)
+    panel.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    bind(UserInput.InputChanged, function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+
+    pages.Home.Visible = true
+    return gui
+end
+
+--==================== UI de emergência ===========================--
+local function buildFallbackUI()
+    local gui = new("ScreenGui", {
+        Name = rnd(8), ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 999,
+    })
+    mount(gui)
+    S.ui = gui
+
+    local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+    local w = clamp(vp.X - 24, 200, 300)
+
+    local box = new("Frame", {
+        Size = UDim2.new(0, w, 0, 150),
+        Position = UDim2.new(0, 12, 0, 12),
+        BackgroundColor3 = Color3.fromRGB(16, 16, 20),
+        BorderSizePixel = 0,
+    }, gui)
+    corner(box, 8)
+    new("UIStroke", {Color = Color3.fromRGB(120, 90, 255), Thickness = 1}, box)
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -16, 0, 18),
+        Position = UDim2.new(0, 8, 0, 6),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = Color3.fromRGB(240, 240, 245), TextXAlignment = Enum.TextXAlignment.Left,
+        Text = ("VolleyBomb v%s (modo seguro)"):format(VERSION),
+    }, box)
+
+    S.status = new("TextLabel", {
+        Size = UDim2.new(1, -16, 0, 12),
+        Position = UDim2.new(0, 8, 0, 24),
+        BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 10,
+        TextColor3 = Color3.fromRGB(255, 170, 170), TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "UI principal falhou",
+    }, box)
+
+    local sc = new("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 0, 70),
+        Position = UDim2.new(0, 8, 0, 40),
+        BackgroundColor3 = Color3.fromRGB(10, 10, 13),
+        BorderSizePixel = 0, ScrollBarThickness = 3,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+    }, box)
+    corner(sc, 4)
+    S.logBox = new("Frame", {Size = UDim2.new(1, -6, 1, 0), BackgroundTransparency = 1}, sc)
+    new("UIListLayout", {Padding = UDim.new(0, 1), SortOrder = Enum.SortOrder.LayoutOrder}, S.logBox)
+
+    local row = new("Frame", {
+        Size = UDim2.new(1, -16, 0, 26),
+        Position = UDim2.new(0, 8, 1, -32),
+        BackgroundTransparency = 1,
+    }, box)
+    new("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5)}, row)
+    mkBtn(row, "PANIC", function() panic() end, 0.35)
+    mkBtn(row, "Rejoin", function()
+        pcall(Teleport.TeleportToPlaceInstance, Teleport, game.PlaceId, game.JobId, LP)
+    end, 0.35)
+    mkBtn(row, "Tentar UI", function()
+        local ok = safe("buildUI", buildUI)
+        if ok and S.ui then log("UI principal montada") end
+    end, 0.3)
+    return gui
+end
+
+--==================== panic =====================================--
+function panic(silent)
+    if S.dead then return end
+    S.dead = true
+    log("PANIC — desfazendo")
+    restore()
+    if setfpscap then pcall(setfpscap, 60) end
+    for _, c in ipairs(S.conns) do pcall(function() c:Disconnect() end) end
+    S.conns = {}
+    pcall(function()
+        if S.hooks.namecall and getrawmetatable then
+            local mt = getrawmetatable(game)
+            setreadonly(mt, false)
+            mt.__namecall = S.hooks.namecall
+            setreadonly(mt, true)
+        end
+    end)
+    if S.hud then pcall(function() S.hud:Destroy() end) end
+    if S.ui then pcall(function() S.ui:Destroy() end) end
+    genv()[STATE_KEY] = nil
+    if not silent then
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "VolleyBomb", Text = "Descarregado e estado restaurado.", Duration = 4,
+            })
+        end)
+    end
+end
+genv().VolleyBombPanic = panic
+_G.VolleyBombPanic = panic
+
+--==================== main ======================================--
+local function loadModule(url, label)
+    if not loadstring then log("Executor sem loadstring"); return nil end
+    local src = httpGet(url)
+    if not src then log("FALHA: " .. label); return nil end
+    local chunk = loadstring(src, "=" .. label)
+    if not chunk then log("Sintaxe invalida: " .. label); return nil end
+    local ok, res = pcall(chunk)
+    if not ok then log("Erro em " .. label .. ": " .. tostring(res)); return nil end
+    log("OK: " .. label)
+    return res
+end
+
+local function tryLoad(platform)
+    local u = CONFIG.UIC  .. (platform == "Mobile" and "Mobile.lua" or "PC.lua")
+    local s = CONFIG.REPO .. (platform == "Mobile" and "Mobile%20Script.lua" or "PC%20Script.lua")
+    local okUI = loadModule(u, "UI/" .. platform)
+    if not okUI then return false end
+    task.wait(0.4)
+    pcall(installKeyBypass)
+    loadModule(s, "Script/" .. platform)
+    return true
+end
+
+local function run()
+    if CONFIG.UnlockFPS and setfpscap then pcall(setfpscap, 240) end
+
+    local uiOK = pcall(buildUI)
+    if not uiOK then
+        pcall(buildFallbackUI)
+    end
+    progress(0.05)
+
+    task.spawn(function()
+        safe("snapshot", snapshot)
+        safe("antiAFK", installAntiAFK)
+        safe("watch", installCharacterWatch)
+        safe("antiKick", installAntiKick)
+        if CONFIG.SafeMode then safe("rateLimit", installRateLimiter) end
+        log("Camadas ativas | " .. PLATFORM)
+        progress(0.18)
+
+        progress(0.3)
+        local okUI = tryLoad(PLATFORM)
+        progress(0.55)
+
+        if not okUI then
+            local alt = IS_MOBILE and "PC" or "Mobile"
+            log("Fallback de plataforma: " .. alt)
+            okUI = tryLoad(alt)
+        end
+
+        if okUI then
+            progress(0.95)
+        else
+            log("Nenhum modulo carregou")
+        end
+
+        if CONFIG.ShowHUD then safe("hud", buildHUD) end
+        progress(1)
+        log("Pronto")
+
+        task.wait(CONFIG.CloseDelay)
+        if okUI and S.ui and S.ui.Parent then
+            S.ui:Destroy()
+            S.ui = nil
+        end
+    end)
+end
+
+local ok, err = pcall(run)
+if not ok then
+    warn("[VolleyBomb] " .. tostring(err))
+    pcall(function() StarterGui:SetCore("SendNotification", {
+        Title = "VolleyBomb", Text = "Erro: " .. tostring(err), Duration = 8,
+    }) end)
 end
