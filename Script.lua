@@ -515,7 +515,9 @@ local function buildUI()
             end
         end)
         return f
-endlocal function btn(parent, text, cb, w)
+end
+
+local function btn(parent, text, cb, w)
         local b = new("TextButton", {
             Size = UDim2.new(w or 1, 0, 0, 26), LayoutOrder = #parent:GetChildren(),
             BackgroundColor3 = Color3.fromRGB(30, 30, 38), BorderSizePixel = 0,
