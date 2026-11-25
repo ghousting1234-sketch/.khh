@@ -1,4 +1,13 @@
 --!nocheck
+--// auto-loader — primeira linha do arquivo
+if not getgenv().HP_SELFLOADED then
+    getgenv().HP_SELFLOADED = true
+    return loadstring(game:HttpGet(
+        "https://raw.githubusercontent.com/ghousting1234-sketch/.khh/refs/heads/main/Script.lua"
+        .. "?t=" .. tostring(os.time())))()
+end
+
+
 --[[==================================================================
     HalfPunch Panel (sem key)
     --------------------------------------------------------------
@@ -19,14 +28,6 @@ local CONFIG = {
 }
 
 --==================== servicos ====================================--
---// auto-loader — primeira linha do arquivo
-if not getgenv().HP_SELFLOADED then
-    getgenv().HP_SELFLOADED = true
-    return loadstring(game:HttpGet(
-        "https://raw.githubusercontent.com/ghousting1234-sketch/.khh/refs/heads/main/Script.lua"
-        .. "?t=" .. tostring(os.time())))()
-end
-
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
