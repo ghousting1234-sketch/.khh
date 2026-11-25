@@ -610,7 +610,9 @@ end-- Combate
         for idx, v in ipairs(order) do if v == S.cfg.hitPart then i = idx end end
         S.cfg.hitPart = order[(i % #order) + 1]
         log("Parte = " .. S.cfg.hitPart)
-    end)-- Extra
+    end)
+
+    -- Extra
     local ex = page("Extra", 3)
     mkBtn(ex, "Godmode (anchor): alternar", toggleGodmode)
     mkBtn(ex, "Fullbright: alternar", function()
